@@ -393,89 +393,155 @@ router.get("/", async (req, res) => {
 
 // POST /api/matches/refresh
 // Persist candidates, updating existing CANDIDATE pairs without duplicates.
+
 router.post("/refresh", async (req, res) => {
   let client;
 
   try {
     client = await pool.connect();
-
     await client.query("BEGIN");
 
-    const upsertQuery = `
-      WITH candidates AS (
-        ${candidateQuery}
-      )
-      INSERT INTO match_records (
-        lost_report_id,
-        found_report_id,
-        location_score,
-        item_score,
-        time_score,
-        description_score,
-        total_score,
-        score_breakdown,
-        match_status,
-        calculated_at
-      )
-      SELECT
-        lost_report_id,
-        found_report_id,
-        location_score,
+    // Prevent simultaneous refreshes from interfering with each other.
+    await client.query(
+      "SELECT pg_advisory_xact_lock($1, $2)",
+      [65000, 1]
+    );
 
-        -- Schema has one item_score column.
-        -- Store category score here; detailed scores remain in JSON.
-        category_score,
+    // Recalculate eligible candidates using the shared matching query.
+    const candidateResult = await client.query(candidateQuery);
+    const candidates = candidateResult.rows;
 
-        time_score,
-        description_score,
-        total_score,
+    // Keep track of the candidate pairs returned by this refresh.
+    const candidatePairs = candidates.map((match) => ({
+      lost_report_id: match.lost_report_id,
+      found_report_id: match.found_report_id,
+    }));
 
-        jsonb_build_object(
-          'location_score', location_score,
-          'category_score', category_score,
-          'color_score', color_score,
-          'title_score', title_score,
-          'description_score', description_score,
-          'distance_m', distance_m,
-          'days_apart', days_apart
-        ),
+    let insertedOrUpdated = 0;
 
-        'CANDIDATE',
-        NOW()
+    // Persist candidates individually using the unique report-pair constraint.
+    for (const match of candidates) {
+      const breakdown = {
+        location_score: Number(match.location_score),
+        category_score: Number(match.category_score),
+        color_score: Number(match.color_score),
+        title_score: Number(match.title_score),
+        description_score: Number(match.description_score),
+        distance_m: Number(match.distance_m),
+        days_apart: Number(match.days_apart),
+      };
 
-      FROM candidates
+      const saved = await client.query(
+        `
+        INSERT INTO match_records (
+          lost_report_id,
+          found_report_id,
+          location_score,
+          item_score,
+          time_score,
+          description_score,
+          total_score,
+          score_breakdown,
+          match_status,
+          calculated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'CANDIDATE', NOW())
 
-      ON CONFLICT (lost_report_id, found_report_id)
-      DO UPDATE SET
-        location_score = EXCLUDED.location_score,
-        item_score = EXCLUDED.item_score,
-        time_score = EXCLUDED.time_score,
-        description_score = EXCLUDED.description_score,
-        total_score = EXCLUDED.total_score,
-        score_breakdown = EXCLUDED.score_breakdown,
-        calculated_at = NOW()
+        ON CONFLICT (lost_report_id, found_report_id)
+        DO UPDATE SET
+          location_score = EXCLUDED.location_score,
+          item_score = EXCLUDED.item_score,
+          time_score = EXCLUDED.time_score,
+          description_score = EXCLUDED.description_score,
+          total_score = EXCLUDED.total_score,
+          score_breakdown = EXCLUDED.score_breakdown,
+          match_status = 'CANDIDATE',
+          calculated_at = NOW()
+        WHERE match_records.match_status IN ('CANDIDATE', 'STALE')
 
-      -- Do not overwrite staff decisions or claim workflow states.
-      WHERE match_records.match_status = 'CANDIDATE'
+        RETURNING match_id
+        `,
+        [
+          match.lost_report_id,
+          match.found_report_id,
+          match.location_score,
+          match.category_score,
+          match.time_score,
+          match.description_score,
+          match.total_score,
+          JSON.stringify(breakdown),
+        ]
+      );
 
-      RETURNING
-        match_id,
-        lost_report_id,
-        found_report_id,
-        total_score,
-        match_status
-    `;
+      if (saved.rowCount > 0) {
+        insertedOrUpdated++;
+      }
+    }
 
-    const result = await client.query(upsertQuery);
+    // Mark old candidates stale if they weren't returned by this refresh.
+    // Never change rejected, verified, returned, or active workflow records.
+    const staleResult = await client.query(
+      `
+      UPDATE match_records mr
+      SET match_status = 'STALE'
+      WHERE mr.match_status = 'CANDIDATE'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM reports l
+          JOIN reports f
+            ON f.report_id = mr.found_report_id
+          WHERE l.report_id = mr.lost_report_id
+            AND f.report_id = mr.found_report_id
+            AND l.report_type = 'LOST'
+            AND f.report_type = 'FOUND'
+            AND l.status = 'OPEN'
+            AND f.status = 'OPEN'
+        )
+      `
+    );
+
+    // Stale any remaining candidates that are no longer in the result set.
+    // An empty candidate set is valid and marks all existing candidates stale.
+    if (candidatePairs.length === 0) {
+      const emptyResult = await client.query(
+        `
+        UPDATE match_records
+        SET match_status = 'STALE'
+        WHERE match_status = 'CANDIDATE'
+        `
+      );
+
+      staleResult.rowCount += emptyResult.rowCount;
+    } else {
+      const stalePairsResult = await client.query(
+        `
+        UPDATE match_records mr
+        SET match_status = 'STALE'
+        WHERE mr.match_status = 'CANDIDATE'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM jsonb_to_recordset($1::jsonb)
+              AS cp(lost_report_id bigint, found_report_id bigint)
+            WHERE cp.lost_report_id = mr.lost_report_id
+              AND cp.found_report_id = mr.found_report_id
+          )
+        `,
+        [JSON.stringify(candidatePairs)]
+      );
+
+      staleResult.rowCount += stalePairsResult.rowCount;
+    }
 
     await client.query("COMMIT");
 
     res.json({
       message: "Match refresh completed",
-      updatedOrCreated: result.rowCount,
-      matches: result.rows,
+      candidatesFound: candidates.length,
+      insertedOrUpdated,
+      markedStale: staleResult.rowCount,
+      matches: candidates,
       note:
-        "Existing non-CANDIDATE match statuses are preserved. Only eligible current candidates are refreshed.",
+        "Only candidate records are refreshed or marked stale. Rejected and claim-workflow statuses are preserved.",
     });
   } catch (error) {
     if (client) {
@@ -500,5 +566,6 @@ router.post("/refresh", async (req, res) => {
     }
   }
 });
+
 
 module.exports = router;
