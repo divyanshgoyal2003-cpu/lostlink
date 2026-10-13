@@ -1,0 +1,15 @@
+node_modules/
+.env
+.env.*
+!.env.example
+dist/
+coverage/
+uploads/
+.DS_Store
+Thumbs.db
+# Logs
+npm-debug.log*
+*.log
+
+# Local editor settings
+.vscode/
