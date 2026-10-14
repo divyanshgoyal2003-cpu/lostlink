@@ -13,15 +13,30 @@ const PORT = process.env.PORT || 5000;
 app.use(helmet());
 app.use(cors());
 app.use(express.json());
-app.use("/api/matches", matchesRouter);
+app.use(
+  "/api/matches",
+  require("./middleware/auth"),
+  matchesRouter
+);
+
 app.use("/api/reports", reportsRouter);
+app.use("/api/auth", require("./routes/auth"));
 
 app.get("/", (req, res) => {
   res.json({
     message: "LostLink API is running",
   });
 });
-
+app.get(
+  "/api/auth/me",
+  require("./middleware/auth"),
+  (req, res) => {
+    res.json({
+      message: "Authentication successful.",
+      user: req.user,
+    });
+  }
+);
 app.get("/api/health", async (req, res) => {
   try {
     const result = await pool.query(

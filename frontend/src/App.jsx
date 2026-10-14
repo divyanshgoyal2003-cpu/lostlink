@@ -1,0 +1,1080 @@
+import { useEffect, useState } from 'react'
+import {
+  loginUser,
+  registerUser,
+  createReport,
+  getMyReports,
+  updateReport,
+  closeReport,
+  getMyMatches,
+} from './api'
+import './App.css'
+
+function App() {
+  const [editingReportId, setEditingReportId] = useState(null)
+  const [editReportForm, setEditReportForm] = useState({
+      title: '',
+      description: '',
+      color: '',
+  })
+const [reportActionMessage, setReportActionMessage] = useState('')
+const [reportActionError, setReportActionError] = useState('')
+const [reportActionLoading, setReportActionLoading] = useState(false)
+  const [activeTab, setActiveTab] = useState('lost')
+  const [authMode, setAuthMode] = useState(null)
+  const [authForm, setAuthForm] = useState({
+    name: '',
+    email: '',
+    phone: '',
+    password: '',
+  })
+  const [authMessage, setAuthMessage] = useState('')
+  const [authError, setAuthError] = useState('')
+const [authLoading, setAuthLoading] = useState(false)
+
+const [reportForm, setReportForm] = useState({
+  category: 'ELECTRONICS',
+  title: '',
+  description: '',
+  color: '',
+  reportType: 'LOST',
+  reportTime: '',
+  latitude: '',
+  longitude: '',
+  locationDescription: '',
+})
+
+const [reportLoading, setReportLoading] = useState(false)
+const [reportMessage, setReportMessage] = useState('')
+const [reportError, setReportError] = useState('')
+
+const [myReports, setMyReports] = useState([])
+const [reportsLoading, setReportsLoading] = useState(false)
+const [reportsError, setReportsError] = useState('')
+const [myMatches, setMyMatches] = useState([])
+const [matchesLoading, setMatchesLoading] = useState(false)
+const [matchesError, setMatchesError] = useState('')
+const [matchesMessage, setMatchesMessage] = useState('')
+
+const [currentUser, setCurrentUser] = useState(() => {
+  try {
+    const savedSession = sessionStorage.getItem('lostlink_session')
+    return savedSession ? JSON.parse(savedSession).user : null
+  } catch {
+    return null
+  }
+})
+
+const [authToken, setAuthToken] = useState(() => {
+  try {
+    const savedSession = sessionStorage.getItem('lostlink_session')
+    return savedSession ? JSON.parse(savedSession).token : null
+  } catch {
+    return null
+  }
+})
+
+  function openAuth(mode) {
+    setAuthMode(mode)
+    setAuthMessage('')
+    setAuthError('')
+    setAuthForm({ name: '', email: '', phone: '', password: '' })
+  }
+
+  function closeAuth() {
+    if (authLoading) return
+    setAuthMode(null)
+    setAuthMessage('')
+    setAuthError('')
+  }
+
+  function updateAuthField(event) {
+    const { name, value } = event.target
+    setAuthForm((previous) => ({ ...previous, [name]: value }))
+  }
+
+  async function handleAuthSubmit(event) {
+    event.preventDefault()
+    setAuthLoading(true)
+    setAuthMessage('')
+    setAuthError('')
+
+    try {
+      const result =
+        authMode === 'signup'
+          ? await registerUser(authForm)
+          : await loginUser({
+              email: authForm.email,
+              password: authForm.password,
+            })
+
+      sessionStorage.setItem(
+        'lostlink_session',
+        JSON.stringify({ user: result.user, token: result.token }),
+      )
+      setCurrentUser(result.user)
+      setAuthToken(result.token)
+      setAuthMessage(
+        authMode === 'signup'
+          ? 'Account created successfully!'
+          : 'You are now logged in!',
+      )
+      setAuthMode(null)
+      setAuthForm({ name: '', email: '', phone: '', password: '' })
+    } catch (error) {
+      setAuthError(error.message || 'Authentication failed. Please try again.')
+    } finally {
+      setAuthLoading(false)
+    }
+  }
+async function handleReportSubmit(event) {
+  event.preventDefault()
+  setReportLoading(true)
+  setReportMessage('')
+  setReportError('')
+
+  try {
+    if (!authToken) {
+      throw new Error('Please log in again before submitting a report.')
+    }
+
+    const latitude = Number(reportForm.latitude)
+    const longitude = Number(reportForm.longitude)
+
+    if (
+      reportForm.latitude.trim() === '' ||
+      reportForm.longitude.trim() === '' ||
+      !Number.isFinite(latitude) ||
+      !Number.isFinite(longitude) ||
+      latitude < -90 ||
+      latitude > 90 ||
+      longitude < -180 ||
+      longitude > 180
+    ) {
+      throw new Error('Enter a valid latitude and longitude.')
+    }
+
+    if (!reportForm.reportTime) {
+      throw new Error('Please select when the item was lost or found.')
+    }
+
+    const result = await createReport(authToken, {
+      category: reportForm.category,
+      title: reportForm.title.trim(),
+      description: reportForm.description.trim() || null,
+      color: reportForm.color.trim() || null,
+      attributes: {},
+      reportType: reportForm.reportType,
+      reportTime: new Date(reportForm.reportTime).toISOString(),
+      latitude,
+      longitude,
+      uncertaintyRadiusM: 75,
+      locationAccuracyM: null,
+      locationSource: 'MAP_PIN',
+      locationDescription: reportForm.locationDescription.trim() || null,
+    })
+
+    setReportMessage(result.message || 'Report submitted successfully!')
+    setReportForm({
+      category: 'ELECTRONICS',
+      title: '',
+      description: '',
+      color: '',
+      reportType: reportForm.reportType,
+      reportTime: '',
+      latitude: '',
+      longitude: '',
+      locationDescription: '',
+    })
+  } catch (error) {
+    setReportError(error.message || 'Could not submit the report.')
+  } finally {
+    setReportLoading(false)
+  }
+}async function loadMyReports()
+
+ {
+  if (!authToken) {
+    setMyReports([])
+    return
+  }
+
+  setReportsLoading(true)
+  setReportsError('')
+
+  try {
+    const result = await getMyReports(authToken)
+    setMyReports(result.reports || [])
+  } catch (error) {
+    setReportsError(error.message || 'Could not load your reports.')
+  } finally {
+    setReportsLoading(false)
+  }
+}
+
+async function loadMyMatches() {
+  if (!authToken) {
+    setMyMatches([])
+    setMatchesError('Please log in to view your matches.')
+    return
+  }
+
+  setMatchesLoading(true)
+  setMatchesError('')
+  setMatchesMessage('')
+
+  try {
+    const result = await getMyMatches(authToken)
+    setMyMatches(result.matches || [])
+
+    if (!result.matches?.length) {
+      setMatchesMessage(
+        'No potential matches are available for your reports yet.'
+      )
+    }
+  } catch (error) {
+    setMatchesError(error.message || 'Could not load your matches.')
+  } finally {
+    setMatchesLoading(false)
+  }
+}
+
+async function handleSaveReport() {
+  if (!authToken || !editingReportId) return
+
+  setReportActionLoading(true)
+  setReportActionMessage('')
+  setReportActionError('')
+
+  try {
+    const result = await updateReport(
+      authToken,
+      editingReportId,
+      {
+        title: editReportForm.title.trim(),
+        description: editReportForm.description.trim(),
+        color: editReportForm.color.trim(),
+      }
+    )
+
+    setReportActionMessage(
+      result.message || 'Report updated successfully.'
+    )
+    setEditingReportId(null)
+    await loadMyReports()
+  } catch (error) {
+    setReportActionError(
+      error.message || 'Could not update the report.'
+    )
+  } finally {
+    setReportActionLoading(false)
+  }
+}
+
+async function handleCloseReport(reportId) {
+  if (!authToken) return
+
+  const confirmed = window.confirm(
+    'Are you sure you want to close this report?'
+  )
+
+  if (!confirmed) return
+
+  setReportActionLoading(true)
+  setReportActionMessage('')
+  setReportActionError('')
+
+  try {
+    const result = await closeReport(authToken, reportId)
+
+    setReportActionMessage(
+      result.message || 'Report closed successfully.'
+    )
+    await loadMyReports()
+  } catch (error) {
+    setReportActionError(
+      error.message || 'Could not close the report.'
+    )
+  } finally {
+    setReportActionLoading(false)
+  }
+}
+
+useEffect(() => {
+  if (authToken) {
+    loadMyReports()
+  } else {
+    setMyReports([])
+  }
+}, [authToken])
+
+  return (
+    <div className="app">
+      <header className="navbar">
+        <a className="brand" href="#">
+          <span className="brand-icon">L</span>
+          <span>Lost<span className="brand-accent">Link</span></span>
+        </a>
+
+        <nav className="nav-links">
+          <a href="#how-it-works">How it works</a>
+          <a href="#safety">Safety</a>
+        </nav>
+
+        <div className="nav-actions">
+          {currentUser ? (
+            <>
+<span className="welcome-user">
+  Hi, {currentUser.name}
+</span>
+<button
+  className="btn btn-ghost"
+  onClick={async () => {
+    await loadMyMatches()
+    document.getElementById('my-matches')?.scrollIntoView({
+      behavior: 'smooth',
+    })
+  }}
+>
+  My matches
+</button>
+<button
+  className="btn btn-ghost"
+  onClick={() => {
+    sessionStorage.removeItem('lostlink_session')
+    setAuthToken(null)
+    setCurrentUser(null)
+    setMyReports([])
+    setAuthMessage('You have been logged out.')
+  }}
+>
+  Log out
+</button>
+
+            </>
+          ) : (
+            <>
+              <button className="btn btn-ghost" onClick={() => openAuth('login')}>
+                Log in
+              </button>
+              <button className="btn btn-primary" onClick={() => openAuth('signup')}>
+                Sign up
+              </button>
+            </>
+          )}
+        </div>
+      </header>
+
+      {authMessage && (
+        <div className="global-message" role="status">
+          {authMessage}
+          <button onClick={() => setAuthMessage('')} aria-label="Dismiss message">×</button>
+        </div>
+      )}
+
+      <main>
+        <section className="hero-section">
+          <div className="hero-content">
+            <div className="eyebrow">
+              <span className="status-dot"></span>
+              A smarter way to reunite people with their belongings
+            </div>
+
+            <h1>
+              Lost something?
+              <br />
+              <span>Let's bring it back.</span>
+            </h1>
+
+            <p className="hero-description">
+              LostLink helps people report missing belongings and find
+              possible matches through a privacy-conscious lost-and-found
+              platform.
+            </p>
+
+            <div className="hero-actions">
+              <button
+                className="btn btn-primary btn-large"
+                onClick={() => {
+                  setActiveTab('lost')
+                  setReportForm((previous) => ({ ...previous, reportType: 'LOST' }))
+                  document.getElementById('report')?.scrollIntoView({ behavior: 'smooth' })
+                  if (!currentUser) openAuth('login')
+                }}
+              >
+                I lost something <span>→</span>
+              </button>
+            <button
+                className="btn btn-secondary btn-large"
+                onClick={() => {
+                  setActiveTab('found')
+                  setReportForm((previous) => ({ ...previous, reportType: 'FOUND' }))
+                  document.getElementById('report')?.scrollIntoView({ behavior: 'smooth' })
+                  if (!currentUser) openAuth('login')
+                }}
+              >
+                I found something
+              </button>
+            </div>
+            <div className="trust-note">
+              <span>✓</span> Your private details stay protected
+            </div>
+          </div>
+
+          <div className="hero-visual" aria-label="LostLink item recovery illustration">
+            <div className="orbit orbit-one"></div>
+            <div className="orbit orbit-two"></div>
+            <div className="floating-card card-top">
+              <span className="item-emoji">🎧</span>
+              <div>
+                <strong>Wireless earbuds</strong>
+                <small>Possible match nearby</small>
+              </div>
+              <span className="match-indicator">↗</span>
+            </div>
+
+            <div className="illustration-circle">
+              <div className="illustration-inner">
+                <span className="illustration-icon">⌕</span>
+                <div className="illustration-text">A little search.</div>
+                <div className="illustration-subtext">A meaningful reunion.</div>
+              </div>
+            </div>
+
+            <div className="floating-card card-bottom">
+              <span className="item-emoji">🎒</span>
+              <div>
+                <strong>One less thing to worry about</strong>
+                <small>Every item has a story</small>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="report-section" id="report">
+          <div className="section-heading">
+            <span className="section-kicker">GET STARTED</span>
+            <h2>Let's find what you're looking for.</h2>
+            <p>Start with a few details. You can review everything before submitting.</p>
+          </div>
+
+          <div className="report-panel">
+            <div className="report-tabs">
+              <button
+                className={activeTab === 'lost' ? 'report-tab active' : 'report-tab'}
+                onClick={() => {
+                  setActiveTab('lost')
+                  setReportForm((previous) => ({
+                       ...previous,
+                       reportType: 'LOST',
+                  }))
+                }}
+              >
+                <span>⌕</span> I lost an item
+              </button>
+              <button
+                className={activeTab === 'found' ? 'report-tab active' : 'report-tab'}
+                onClick={() => {
+                        setActiveTab('found')
+                        setReportForm((previous) => ({
+                          ...previous,
+                          reportType: 'FOUND',
+                        }))
+                }}
+              >
+                <span>✓</span> I found an item
+              </button>
+            </div>
+<form className="report-form" onSubmit={handleReportSubmit}>
+  <div className="report-form-heading">
+    <h3>
+      {activeTab === 'lost'
+        ? 'Tell us what you lost'
+        : 'Tell us what you found'}
+    </h3>
+    <p>
+      {activeTab === 'lost'
+        ? 'Describe your missing item to help identify possible matches.'
+        : 'Share details to help reunite this item with its owner.'}
+    </p>
+  </div>
+  <label htmlFor="report-category">Item category</label>
+  <select
+    id="report-category"
+    value={reportForm.category}
+    onChange={(e) =>
+      setReportForm({ ...reportForm, category: e.target.value })
+    }
+    required
+  >
+    <option value="ELECTRONICS">Electronics</option>
+    <option value="DOC_CARDS">Documents and cards</option>
+    <option value="ACCESSORIES">Accessories</option>
+    <option value="CLOTHING">Clothing</option>
+    <option value="BAGS">Bags</option>
+    <option value="OTHER">Other</option>
+  </select>
+
+  <label htmlFor="report-title">Item name</label>
+  <input
+    id="report-title"
+    value={reportForm.title}
+    onChange={(e) =>
+      setReportForm({ ...reportForm, title: e.target.value })
+    }
+    maxLength={160}
+    required
+    placeholder="e.g. Blue wireless headphones"
+  />
+
+  <label htmlFor="report-description">Description</label>
+  <textarea
+    id="report-description"
+    value={reportForm.description}
+    onChange={(e) =>
+      setReportForm({ ...reportForm, description: e.target.value })
+    }
+    rows={3}
+    placeholder="Brand, model, identifying details..."
+  />
+
+  <label htmlFor="report-color">Color (optional)</label>
+  <input
+    id="report-color"
+    value={reportForm.color}
+    onChange={(e) =>
+      setReportForm({ ...reportForm, color: e.target.value })
+    }
+    placeholder="e.g. Navy blue"
+  />
+
+  <label htmlFor="report-time">
+    When was it {activeTab === 'lost' ? 'lost' : 'found'}?
+  </label>
+  <input
+    id="report-time"
+    type="datetime-local"
+    value={reportForm.reportTime}
+    onChange={(e) =>
+      setReportForm({ ...reportForm, reportTime: e.target.value })
+    }
+    required
+  />
+
+  <h4>Approximate location</h4>
+  <p>Enter coordinates for now; a map picker will come later.</p>
+
+  <div className="report-coordinate-grid">
+    <div>
+      <label htmlFor="report-latitude">Latitude</label>
+      <input
+        id="report-latitude"
+        type="number"
+        step="any"
+        min="-90"
+        max="90"
+        value={reportForm.latitude}
+        onChange={(e) =>
+          setReportForm({ ...reportForm, latitude: e.target.value })
+        }
+        required
+        placeholder="Latitude"
+      />
+    </div>
+    <div>
+      <label htmlFor="report-longitude">Longitude</label>
+      <input
+        id="report-longitude"
+        type="number"
+        step="any"
+        min="-180"
+        max="180"
+        value={reportForm.longitude}
+        onChange={(e) =>
+          setReportForm({ ...reportForm, longitude: e.target.value })
+        }
+        required
+        placeholder="Longitude"
+      />
+    </div>
+  </div>
+
+  <label htmlFor="report-location-description">
+    Location description (optional)
+  </label>
+  <input
+    id="report-location-description"
+    value={reportForm.locationDescription}
+    onChange={(e) =>
+      setReportForm({
+        ...reportForm,
+        locationDescription: e.target.value,
+      })
+    }
+    placeholder="e.g. Near the library entrance"
+  />
+
+  {reportError && (
+    <p className="auth-error" role="alert">{reportError}</p>
+  )}
+
+  {reportMessage && (
+    <p className="report-success" role="status">{reportMessage}</p>
+  )}
+
+  <button
+    type="submit"
+    className="btn btn-primary report-submit"
+    disabled={reportLoading || !currentUser || !authToken}
+  >
+    {reportLoading
+      ? 'Submitting...'
+      : `Submit ${activeTab === 'lost' ? 'lost' : 'found'} report`}
+  </button>
+
+  {!currentUser && (
+    <p className="report-login-note">
+      Please log in before submitting a report.
+    </p>
+  )}
+</form>
+
+          </div>
+        </section>
+
+        <section className="steps-section" id="how-it-works">
+          <div className="section-heading">
+            <span className="section-kicker">HOW IT WORKS</span>
+            <h2>Small details. Better connections.</h2>
+            <p>A straightforward process designed around privacy and responsible recovery.</p>
+          </div>
+
+          <div className="steps-grid">
+            <article className="step-card">
+              <span className="step-number">01</span>
+              <div className="step-icon">✎</div>
+              <h3>Describe the item</h3>
+              <p>Provide details about the item, when it went missing, and its approximate location.</p>
+            </article>
+            <article className="step-card">
+              <span className="step-number">02</span>
+              <div className="step-icon">⌕</div>
+              <h3>Explore possible matches</h3>
+              <p>LostLink compares relevant details to help identify promising matches.</p>
+            </article>
+            <article className="step-card">
+              <span className="step-number">03</span>
+              <div className="step-icon">♡</div>
+              <h3>Verify and reconnect</h3>
+              <p>Ownership verification helps people arrange a safe return without exposing private details.</p>
+            </article>
+          </div>
+        </section>
+
+<section className="my-reports-section" id="my-reports">
+  {reportActionMessage && (
+  <p className="report-success" role="status">
+    {reportActionMessage}
+  </p>
+)}
+
+{reportActionError && (
+  <p className="auth-error" role="alert">
+    {reportActionError}
+  </p>
+)}
+  <div className="section-heading">
+    <span className="section-kicker">YOUR ACTIVITY</span>
+    <h2>My reports</h2>
+    <p>Keep track of the items you've reported lost or found.</p>
+  </div>
+
+  {!currentUser ? (
+    <div className="my-reports-empty">
+      <p>Please log in to view your reports.</p>
+      <button
+        className="btn btn-primary"
+        onClick={() => openAuth('login')}
+      >
+        Log in
+      </button>
+    </div>
+  ) : reportsLoading ? (
+    <div className="my-reports-empty">Loading your reports...</div>
+  ) : reportsError ? (
+    <div className="my-reports-empty">
+      <p className="auth-error">{reportsError}</p>
+      <button
+        className="btn btn-secondary"
+        onClick={loadMyReports}
+      >
+        Try again
+      </button>
+    </div>
+  ) : myReports.length === 0 ? (
+    <div className="my-reports-empty">
+      <div className="placeholder-icon">⌕</div>
+      <h3>No reports yet</h3>
+      <p>Your submitted lost and found reports will appear here.</p>
+      <button
+        className="btn btn-primary"
+        onClick={() =>
+          document.getElementById('report')?.scrollIntoView({
+            behavior: 'smooth',
+          })
+        }
+      >
+        Create a report
+      </button>
+    </div>
+  ) : (
+    <div className="my-reports-list">
+      {myReports.map((report) => (
+        <article
+          className="my-report-card"
+          key={report.report_id}
+        >
+          <div className="my-report-card-top">
+            <span
+              className={
+                report.report_type === 'LOST'
+                  ? 'report-type-badge lost-badge'
+                  : 'report-type-badge found-badge'
+              }
+            >
+              {report.report_type}
+            </span>
+            <span className="my-report-status">
+              {(report.status || 'OPEN').replaceAll('_', ' ')}
+            </span>
+          </div>
+          <h3>{report.title || report.item_title || 'Reported item'}</h3>
+          {report.category && (
+            <p className="my-report-category">
+              {report.category.replaceAll('_', ' ')}
+            </p>
+          )}
+          {report.report_time && (
+            <p className="my-report-date">
+              Reported time: {new Date(report.report_time).toLocaleString()}
+            </p>
+          )}
+
+          <p className="my-report-id">
+            Report ID: {report.report_id}
+          </p>
+          {editingReportId === report.report_id ? (
+  <div className="edit-report-form">
+    <label>
+      Item title
+      <input
+        value={editReportForm.title}
+        maxLength={160}
+        onChange={(event) =>
+          setEditReportForm((prev) => ({
+            ...prev,
+            title: event.target.value,
+          }))
+        }
+      />
+    </label>
+
+    <label>
+      Description
+      <textarea
+        rows={3}
+        maxLength={5000}
+        value={editReportForm.description}
+        onChange={(event) =>
+          setEditReportForm((prev) => ({
+            ...prev,
+            description: event.target.value,
+          }))
+        }
+      />
+    </label>
+
+    <label>
+      Colour
+      <input
+        maxLength={100}
+        value={editReportForm.color}
+        onChange={(event) =>
+          setEditReportForm((prev) => ({
+            ...prev,
+            color: event.target.value,
+          }))
+        }
+      />
+    </label>
+
+    <div className="report-action-buttons">
+      <button
+        type="button"
+        className="btn btn-primary"
+        disabled={reportActionLoading}
+        onClick={handleSaveReport}
+      >
+        {reportActionLoading ? 'Saving...' : 'Save changes'}
+      </button>
+
+      <button
+        type="button"
+        className="btn btn-secondary"
+        disabled={reportActionLoading}
+        onClick={() => setEditingReportId(null)}
+      >
+        Cancel
+      </button>
+    </div>
+  </div>
+) : (
+  <div className="report-action-buttons">
+    <button
+      type="button"
+      className="btn btn-secondary"
+      disabled={reportActionLoading}
+      onClick={() => {
+        setEditReportForm({
+          title: report.title || '',
+          description: report.description || '',
+          color: report.color || '',
+        })
+        setEditingReportId(report.report_id)
+        setReportActionMessage('')
+        setReportActionError('')
+      }}
+    >
+      Edit
+    </button>
+
+    {report.status === 'OPEN' && (
+      <button
+        type="button"
+        className="btn btn-secondary"
+        disabled={reportActionLoading}
+        onClick={() => handleCloseReport(report.report_id)}
+      >
+        Close report
+      </button>
+    )}
+  </div>
+)}
+        </article>
+      ))}
+    </div>
+  )}
+</section>
+<section className="my-reports-section" id="my-matches">
+  <div className="section-heading">
+    <span className="section-kicker">MATCHING</span>
+    <h2>My matches</h2>
+    <p>
+      Potential matches based on item details and approximate location.
+    </p>
+  </div>
+
+  {!currentUser ? (
+    <div className="my-reports-empty">
+      <p>Please log in to view your matches.</p>
+    </div>
+  ) : matchesLoading ? (
+    <div className="my-reports-empty">
+      Loading your matches...
+    </div>
+  ) : matchesError ? (
+    <div className="my-reports-empty">
+      <p className="auth-error">{matchesError}</p>
+      <button
+        className="btn btn-secondary"
+        onClick={loadMyMatches}
+      >
+        Try again
+      </button>
+    </div>
+  ) : myMatches.length === 0 ? (
+    <div className="my-reports-empty">
+      <div className="placeholder-icon">⌕</div>
+      <h3>No potential matches yet</h3>
+      <p>
+        Potential matches for your reports will appear here when available.
+      </p>
+      <button
+        className="btn btn-primary"
+        onClick={loadMyMatches}
+      >
+        Check matches
+      </button>
+    </div>
+  ) : (
+    <div className="my-reports-list">
+      {myMatches.map((match, index) => (
+        <article
+          className="my-report-card"
+          key={`${match.category}-${index}`}
+        >
+          <div className="my-report-card-top">
+            <span className="report-type-badge">
+              POTENTIAL MATCH
+            </span>
+            <span className="my-report-status">
+              Score: {Math.round(match.matchScore)}/100
+            </span>
+          </div>
+
+          <h3>
+            {match.category?.replaceAll('_', ' ') ||
+              'Possible item match'}
+          </h3>
+
+          <p>
+            Approximate distance: {match.approximateDistanceM} m
+          </p>
+          <p>Reported times: {match.daysApart} days apart</p>
+          <p>
+            The score is an estimate, not a probability or proof
+            of ownership.
+          </p>
+        </article>
+      ))}
+    </div>
+  )}
+</section>
+        <section className="safety-banner" id="safety">
+          <div className="safety-icon">⌑</div>
+          <div>
+            <h2>Your belongings matter. Your privacy does too.</h2>
+            <p>Potential matches are not proof of ownership. Verification and careful information sharing remain important.</p>
+          </div>
+        </section>
+      </main>
+
+      <footer className="footer">
+        <a className="brand" href="#">
+          <span className="brand-icon">L</span>
+          <span>Lost<span className="brand-accent">Link</span></span>
+        </a>
+        <span>Helping lost things find their way home.</span>
+        <span>© {new Date().getFullYear()} LostLink</span>
+      </footer>
+
+      {authMode && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) closeAuth()
+          }}
+        >
+          <section
+            className="auth-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="auth-title"
+          >
+            <button
+              className="modal-close"
+              onClick={closeAuth}
+              disabled={authLoading}
+              aria-label="Close authentication form"
+            >
+              ×
+            </button>
+
+            <span className="section-kicker">WELCOME TO LOSTLINK</span>
+            <h2 id="auth-title">
+              {authMode === 'signup' ? 'Create your account' : 'Welcome back'}
+            </h2>
+            <p className="auth-description">
+              {authMode === 'signup'
+                ? 'Join LostLink and help belongings find their way home.'
+                : 'Log in to manage your reports and continue your search.'}
+            </p>
+
+            <form className="auth-form" onSubmit={handleAuthSubmit}>
+              {authMode === 'signup' && (
+                <>
+                  <label htmlFor="auth-name">Full name</label>
+                  <input
+                    id="auth-name"
+                    name="name"
+                    autoComplete="name"
+                    value={authForm.name}
+                    onChange={updateAuthField}
+                    maxLength={120}
+                    required
+                    placeholder="Your name"
+                  />
+
+                  <label htmlFor="auth-phone">Phone (optional)</label>
+                  <input
+                    id="auth-phone"
+                    name="phone"
+                    type="tel"
+                    autoComplete="tel"
+                    value={authForm.phone}
+                    onChange={updateAuthField}
+                    placeholder="Your phone number"
+                  />
+                </>
+              )}
+
+              <label htmlFor="auth-email">Email address</label>
+              <input
+                id="auth-email"
+                name="email"
+                type="email"
+                autoComplete="email"
+                value={authForm.email}
+                onChange={updateAuthField}
+                maxLength={254}
+                required
+                placeholder="you@example.com"
+              />
+
+              <label htmlFor="auth-password">Password</label>
+              <input
+                id="auth-password"
+                name="password"
+                type="password"
+                autoComplete={authMode === 'signup' ? 'new-password' : 'current-password'}
+                value={authForm.password}
+                onChange={updateAuthField}
+                minLength={authMode === 'signup' ? 8 : undefined}
+                required
+                placeholder={authMode === 'signup' ? 'At least 8 characters' : 'Your password'}
+              />
+
+              {authError && (
+                <p className="auth-error" role="alert">{authError}</p>
+              )}
+
+              <button
+                className="btn btn-primary auth-submit"
+                type="submit"
+                disabled={authLoading}
+              >
+                {authLoading
+                  ? 'Please wait...'
+                  : authMode === 'signup'
+                    ? 'Create account'
+                    : 'Log in'}
+              </button>
+            </form>
+
+            <p className="auth-switch">
+              {authMode === 'signup' ? 'Already have an account?' : "Don't have an account?"}{' '}
+              <button
+                onClick={() => openAuth(authMode === 'signup' ? 'login' : 'signup')}
+                disabled={authLoading}
+              >
+                {authMode === 'signup' ? 'Log in' : 'Sign up'}
+              </button>
+            </p>
+          </section>
+        </div>
+      )}
+    </div>
+  )
+}
+
+export default App

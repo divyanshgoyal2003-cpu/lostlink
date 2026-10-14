@@ -372,24 +372,41 @@ const candidateQuery = `
 
 // GET /api/matches
 // Read-only: calculates candidates without modifying match_records.
+
 router.get("/", async (req, res) => {
   try {
-    const result = await pool.query(candidateQuery);
+    const result = await pool.query(
+      `
+      SELECT m.*
+      FROM (${candidateQuery}) AS m
+      JOIN reports l ON l.report_id = m.lost_report_id
+      JOIN reports f ON f.report_id = m.found_report_id
+      WHERE l.user_id = $1 OR f.user_id = $1
+      ORDER BY m.total_score DESC, m.distance_m ASC
+      `,
+      [req.user.userId]
+    );
 
-    res.json({
-      count: result.rowCount,
-      matches: result.rows,
-      note:
-        "Item-compatible candidates are filtered before spatial scoring. Scores are heuristics, not probabilities or proof of ownership.",
-    });
+    return res.json({
+  count: result.rowCount,
+  matches: result.rows.map((match) => ({
+    matchScore: Number(match.total_score),
+    category: match.lost_category,
+    approximateDistanceM: Math.round(Number(match.distance_m) / 100) * 100,
+    daysApart: Number(match.days_apart),
+    status: "CANDIDATE"
+  })),
+  note: "Match scores are estimates, not probabilities or proof of ownership."
+});
   } catch (error) {
     console.error("Find matches failed:", error.message);
 
-    res.status(500).json({
-      error: "Unable to calculate candidate matches",
+    return res.status(500).json({
+      error: "Unable to calculate candidate matches"
     });
   }
 });
+
 
 // POST /api/matches/refresh
 // Persist candidates, updating existing CANDIDATE pairs without duplicates.
@@ -535,14 +552,12 @@ router.post("/refresh", async (req, res) => {
     await client.query("COMMIT");
 
     res.json({
-      message: "Match refresh completed",
-      candidatesFound: candidates.length,
-      insertedOrUpdated,
-      markedStale: staleResult.rowCount,
-      matches: candidates,
-      note:
-        "Only candidate records are refreshed or marked stale. Rejected and claim-workflow statuses are preserved.",
-    });
+  message: "Match refresh completed",
+  candidatesFound: candidates.length,
+  insertedOrUpdated,
+  markedStale: staleResult.rowCount,
+  note: "Candidate matches refreshed successfully."
+});
   } catch (error) {
     if (client) {
       try {

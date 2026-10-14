@@ -1,6 +1,7 @@
 
 const express = require("express");
 const pool = require("../config/db");
+const authenticateToken = require("../middleware/auth");
 
 const router = express.Router();
 
@@ -18,7 +19,9 @@ const VALID_LOCATION_SOURCES = ["GPS", "MAP_PIN"];
 
 // GET /api/reports
 // Retrieve open reports, newest first.
-router.get("/", async (req, res) => {
+// We will restrict this endpoint separately before exposing private details.
+
+router.get("/", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT
@@ -26,15 +29,9 @@ router.get("/", async (req, res) => {
         r.report_type,
         r.report_time,
         r.status,
-        r.uncertainty_radius_m,
-        r.location_description,
-        i.item_id,
         i.category,
         i.title,
-        i.description,
         i.color,
-        ST_Y(r.location_point::geometry) AS latitude,
-        ST_X(r.location_point::geometry) AS longitude,
         r.created_at
       FROM reports r
       JOIN items i ON i.item_id = r.item_id
@@ -43,21 +40,27 @@ router.get("/", async (req, res) => {
       LIMIT 100
     `);
 
-    res.json({
+    return res.json({
       count: result.rowCount,
-      reports: result.rows,
+      reports: result.rows
     });
   } catch (error) {
     console.error("Get reports failed:", error.message);
-    res.status(500).json({ error: "Unable to retrieve reports" });
+
+    return res.status(500).json({
+      error: "Unable to retrieve reports"
+    });
   }
 });
 
+
 // POST /api/reports
 // Create an item and its lost/found report atomically.
-router.post("/", async (req, res) => {
+// The authenticated user's ID comes from the verified JWT.
+router.post("/", authenticateToken, async (req, res) => {
+  const userId = req.user.userId;
+
   const {
-    userId,
     category,
     title,
     description = null,
@@ -75,7 +78,6 @@ router.post("/", async (req, res) => {
 
   // Validate required fields.
   if (
-    userId == null ||
     !category ||
     !title ||
     !reportType ||
@@ -90,20 +92,24 @@ router.post("/", async (req, res) => {
   }
 
   if (!VALID_CATEGORIES.includes(category)) {
-    return res.status(400).json({ error: "Invalid category" });
+    return res.status(400).json({
+      error: "Invalid category",
+    });
   }
 
   if (!VALID_REPORT_TYPES.includes(reportType)) {
-    return res.status(400).json({ error: "reportType must be LOST or FOUND" });
+    return res.status(400).json({
+      error: "reportType must be LOST or FOUND",
+    });
   }
 
   if (!VALID_LOCATION_SOURCES.includes(locationSource)) {
-    return res.status(400).json({ error: "locationSource must be GPS or MAP_PIN" });
+    return res.status(400).json({
+      error: "locationSource must be GPS or MAP_PIN",
+    });
   }
 
   if (
-    !Number.isInteger(Number(userId)) ||
-    Number(userId) <= 0 ||
     !Number.isFinite(Number(latitude)) ||
     !Number.isFinite(Number(longitude)) ||
     Number(latitude) < -90 ||
@@ -112,7 +118,7 @@ router.post("/", async (req, res) => {
     Number(longitude) > 180
   ) {
     return res.status(400).json({
-      error: "Invalid user ID or geographic coordinates",
+      error: "Invalid geographic coordinates",
     });
   }
 
@@ -123,6 +129,24 @@ router.post("/", async (req, res) => {
   ) {
     return res.status(400).json({
       error: "Title must contain 1–160 characters",
+    });
+  }
+
+  if (
+    description !== null &&
+    (typeof description !== "string" || description.length > 5000)
+  ) {
+    return res.status(400).json({
+      error: "Description must be a string of at most 5000 characters",
+    });
+  }
+
+  if (
+    color !== null &&
+    (typeof color !== "string" || color.length > 100)
+  ) {
+    return res.status(400).json({
+      error: "Color must be a string of at most 100 characters",
     });
   }
 
@@ -156,8 +180,23 @@ router.post("/", async (req, res) => {
     });
   }
 
-  if (Number.isNaN(Date.parse(reportTime))) {
-    return res.status(400).json({ error: "Invalid reportTime" });
+  if (
+    typeof reportTime !== "string" ||
+    Number.isNaN(Date.parse(reportTime))
+  ) {
+    return res.status(400).json({
+      error: "Invalid reportTime",
+    });
+  }
+
+  if (
+    locationDescription !== null &&
+    (typeof locationDescription !== "string" ||
+      locationDescription.length > 500)
+  ) {
+    return res.status(400).json({
+      error: "Location description must be a string of at most 500 characters",
+    });
   }
 
   const client = await pool.connect();
@@ -165,7 +204,7 @@ router.post("/", async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // Ensure the supplied user exists and is active.
+    // Ensure the authenticated user still exists and is active.
     const userResult = await client.query(
       `SELECT user_id FROM users
        WHERE user_id = $1 AND account_status = 'ACTIVE'`,
@@ -174,7 +213,7 @@ router.post("/", async (req, res) => {
 
     if (userResult.rowCount === 0) {
       await client.query("ROLLBACK");
-      return res.status(400).json({
+      return res.status(403).json({
         error: "User does not exist or is not active",
       });
     }
@@ -238,7 +277,12 @@ router.post("/", async (req, res) => {
       report: reportResult.rows[0],
     });
   } catch (error) {
-    await client.query("ROLLBACK");
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackError) {
+      console.error("Report transaction rollback failed:", rollbackError.message);
+    }
+
     console.error("Create report failed:", error.message);
 
     return res.status(500).json({
@@ -246,6 +290,233 @@ router.post("/", async (req, res) => {
     });
   } finally {
     client.release();
+  }
+});
+
+/**
+ * GET /api/reports/mine
+ * Retrieve reports owned by the authenticated user.
+ */
+router.get("/mine", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT
+         r.report_id,
+         r.report_type,
+         r.report_time,
+         r.status,
+         r.uncertainty_radius_m,
+         r.location_description,
+         i.item_id,
+         i.category,
+         i.title,
+         i.description,
+         i.color,
+         ST_Y(r.location_point::geometry) AS latitude,
+         ST_X(r.location_point::geometry) AS longitude,
+         r.created_at
+       FROM reports r
+       JOIN items i ON i.item_id = r.item_id
+       WHERE r.user_id = $1
+       ORDER BY r.created_at DESC`,
+      [req.user.userId]
+    );
+
+    return res.json({
+      count: result.rowCount,
+      reports: result.rows,
+    });
+  } catch (error) {
+    console.error("Get own reports failed:", error.message);
+
+    return res.status(500).json({
+      error: "Unable to retrieve your reports",
+    });
+  }
+});
+
+/**
+ * PATCH /api/reports/:id
+ * Update an open report owned by the authenticated user.
+ */
+router.patch("/:id", authenticateToken, async (req, res) => {
+  const reportId = req.params.id;
+
+  if (!/^[1-9]\d*$/.test(reportId)) {
+    return res.status(400).json({ error: "Invalid report ID" });
+  }
+
+  const { title, description, color, category } = req.body;
+
+  if (
+    title === undefined &&
+    description === undefined &&
+    color === undefined &&
+    category === undefined
+  ) {
+    return res.status(400).json({
+      error: "Provide at least one field to update",
+    });
+  }
+
+  if (
+    title !== undefined &&
+    (typeof title !== "string" ||
+      title.trim().length === 0 ||
+      title.length > 160)
+  ) {
+    return res.status(400).json({
+      error: "Title must contain 1–160 characters",
+    });
+  }
+
+  if (
+    description !== undefined &&
+    description !== null &&
+    (typeof description !== "string" || description.length > 5000)
+  ) {
+    return res.status(400).json({
+      error: "Description must be at most 5000 characters",
+    });
+  }
+
+  if (
+    color !== undefined &&
+    color !== null &&
+    (typeof color !== "string" || color.length > 100)
+  ) {
+    return res.status(400).json({
+      error: "Color must be at most 100 characters",
+    });
+  }
+
+  if (
+    category !== undefined &&
+    !VALID_CATEGORIES.includes(category)
+  ) {
+    return res.status(400).json({ error: "Invalid category" });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    // Only update a report belonging to this authenticated user.
+    const reportResult = await client.query(
+      `SELECT r.report_id, r.item_id
+       FROM reports r
+       WHERE r.report_id = $1
+         AND r.user_id = $2
+         AND r.status = 'OPEN'
+       FOR UPDATE`,
+      [reportId, req.user.userId]
+    );
+
+    if (reportResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        error: "Open report not found",
+      });
+    }
+
+    const itemId = reportResult.rows[0].item_id;
+
+    const updates = [];
+    const values = [];
+    let index = 1;
+
+    if (title !== undefined) {
+      updates.push(`title = $${index++}`);
+      values.push(title.trim());
+    }
+
+    if (description !== undefined) {
+      updates.push(`description = $${index++}`);
+      values.push(description);
+    }
+
+    if (color !== undefined) {
+      updates.push(`color = $${index++}`);
+      values.push(color);
+    }
+
+    if (category !== undefined) {
+      updates.push(`category = $${index++}`);
+      values.push(category);
+    }
+
+    values.push(itemId);
+
+    const updateResult = await client.query(
+      `UPDATE items
+       SET ${updates.join(", ")}
+       WHERE item_id = $${index}
+       RETURNING item_id, category, title, description, color`,
+      values
+    );
+
+    await client.query("COMMIT");
+
+    return res.json({
+      message: "Report updated successfully",
+      item: updateResult.rows[0],
+    });
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackError) {
+      console.error("Update rollback failed:", rollbackError.message);
+    }
+
+    console.error("Update report failed:", error.message);
+
+    return res.status(500).json({
+      error: "Unable to update report",
+    });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * PATCH /api/reports/:id/close
+ * Close an open report owned by the authenticated user.
+ */
+router.patch("/:id/close", authenticateToken, async (req, res) => {
+  const reportId = req.params.id;
+
+  if (!/^[1-9]\d*$/.test(reportId)) {
+    return res.status(400).json({ error: "Invalid report ID" });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE reports
+       SET status = 'CANCELLED'
+       WHERE report_id = $1
+         AND user_id = $2
+         AND status = 'OPEN'
+       RETURNING report_id, report_type, status`,
+      [reportId, req.user.userId]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        error: "Open report not found",
+      });
+    }
+
+    return res.json({
+      message: "Report closed successfully",
+      report: result.rows[0],
+    });
+  } catch (error) {
+    console.error("Close report failed:", error.message);
+
+    return res.status(500).json({
+      error: "Unable to close report",
+    });
   }
 });
 
