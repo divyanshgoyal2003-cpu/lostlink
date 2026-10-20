@@ -43,16 +43,30 @@ const candidateQuery = `
       fi.description AS found_description,
 
       li.color AS lost_color,
-      fi.color AS found_color
+      fi.color AS found_color,
+
+      COALESCE(
+        NULLIF(LOWER(TRIM(li.attributes_json->>'company')), ''),
+        NULLIF(LOWER(TRIM(li.attributes_json->>'brand')), ''),
+        NULLIF(LOWER(TRIM(le.brand)), '')
+      ) AS lost_brand,
+
+      COALESCE(
+        NULLIF(LOWER(TRIM(fi.attributes_json->>'company')), ''),
+        NULLIF(LOWER(TRIM(fi.attributes_json->>'brand')), ''),
+        NULLIF(LOWER(TRIM(fe.brand)), '')
+      ) AS found_brand
 
     FROM reports l
     JOIN items li ON li.item_id = l.item_id
+    LEFT JOIN electronics le ON le.item_id = li.item_id
 
     JOIN reports f
       ON f.report_type = 'FOUND'
      AND f.status = 'OPEN'
 
     JOIN items fi ON fi.item_id = f.item_id
+    LEFT JOIN electronics fe ON fe.item_id = fi.item_id
 
     WHERE l.report_type = 'LOST'
       AND l.status = 'OPEN'
@@ -60,6 +74,28 @@ const candidateQuery = `
 
       -- Require the same broad item category.
       AND li.category = fi.category
+      -- Reject candidates when both known brands differ.
+      AND (
+        COALESCE(
+          NULLIF(LOWER(TRIM(li.attributes_json->>'company')), ''),
+          NULLIF(LOWER(TRIM(li.attributes_json->>'brand')), ''),
+          NULLIF(LOWER(TRIM(le.brand)), '')
+        ) IS NULL
+        OR COALESCE(
+          NULLIF(LOWER(TRIM(fi.attributes_json->>'company')), ''),
+          NULLIF(LOWER(TRIM(fi.attributes_json->>'brand')), ''),
+          NULLIF(LOWER(TRIM(fe.brand)), '')
+        ) IS NULL
+        OR COALESCE(
+          NULLIF(LOWER(TRIM(li.attributes_json->>'company')), ''),
+          NULLIF(LOWER(TRIM(li.attributes_json->>'brand')), ''),
+          NULLIF(LOWER(TRIM(le.brand)), '')
+        ) = COALESCE(
+          NULLIF(LOWER(TRIM(fi.attributes_json->>'company')), ''),
+          NULLIF(LOWER(TRIM(fi.attributes_json->>'brand')), ''),
+          NULLIF(LOWER(TRIM(fe.brand)), '')
+        )
+      )
 
       -- Initial rule to reject contradictory headphone/earbud types.
       AND NOT (
