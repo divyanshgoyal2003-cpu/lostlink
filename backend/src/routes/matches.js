@@ -55,7 +55,17 @@ const candidateQuery = `
         NULLIF(LOWER(TRIM(fi.attributes_json->>'company')), ''),
         NULLIF(LOWER(TRIM(fi.attributes_json->>'brand')), ''),
         NULLIF(LOWER(TRIM(fe.brand)), '')
-      ) AS found_brand
+      ) AS found_brand,
+
+      COALESCE(
+        NULLIF(LOWER(TRIM(li.attributes_json->>'model')), ''),
+        NULLIF(LOWER(TRIM(le.model)), '')
+      ) AS lost_model,
+
+      COALESCE(
+        NULLIF(LOWER(TRIM(fi.attributes_json->>'model')), ''),
+        NULLIF(LOWER(TRIM(fe.model)), '')
+      ) AS found_model
 
     FROM reports l
     JOIN items li ON li.item_id = l.item_id
@@ -217,6 +227,18 @@ const candidateQuery = `
 
         ELSE 0
       END AS color_score,
+
+      -- Model compatibility: unknown models are neutral; known conflicts score 0.
+      CASE
+        WHEN NULLIF(TRIM(lost_model), '') IS NULL
+          OR NULLIF(TRIM(found_model), '') IS NULL
+          THEN 50
+
+        WHEN LOWER(TRIM(lost_model)) = LOWER(TRIM(found_model))
+          THEN 100
+
+        ELSE 0
+      END AS model_score,
 
       -- Time proximity score: 0-100.
       CASE
@@ -381,18 +403,20 @@ const candidateQuery = `
     location_score,
     category_score,
     color_score,
+    model_score,
     time_score,
     title_score,
     description_score,
 
     ROUND(
       (
-        location_score * 0.45
+         location_score * 0.40
         + category_score * 0.15
         + color_score * 0.10
         + time_score * 0.15
         + title_score * 0.05
-        + description_score * 0.10
+        + description_score * 0.05
+        + model_score * 0.10
       )::numeric,
       2
     ) AS total_score
@@ -427,6 +451,7 @@ router.get("/", async (req, res) => {
   count: result.rowCount,
   matches: result.rows.map((match) => ({
     matchScore: Number(match.total_score),
+    modelScore: Number(match.model_score),
     category: match.lost_category,
     approximateDistanceM: Math.round(Number(match.distance_m) / 100) * 100,
     daysApart: Number(match.days_apart),
@@ -478,6 +503,7 @@ router.post("/refresh", async (req, res) => {
         location_score: Number(match.location_score),
         category_score: Number(match.category_score),
         color_score: Number(match.color_score),
+        model_score: Number(match.model_score),
         title_score: Number(match.title_score),
         description_score: Number(match.description_score),
         distance_m: Number(match.distance_m),
