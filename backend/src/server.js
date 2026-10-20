@@ -1,11 +1,13 @@
-const matchesRouter = require("./routes/matches");
-const reportsRouter = require("./routes/reports");
+
+require("dotenv").config();
+
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
-require("dotenv").config();
 
 const pool = require("./config/db");
+const matchesRouter = require("./routes/matches");
+const reportsRouter = require("./routes/reports");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -13,6 +15,7 @@ const PORT = process.env.PORT || 5000;
 app.use(helmet());
 app.use(cors());
 app.use(express.json());
+
 app.use(
   "/api/matches",
   require("./middleware/auth"),
@@ -27,6 +30,7 @@ app.get("/", (req, res) => {
     message: "LostLink API is running",
   });
 });
+
 app.get(
   "/api/auth/me",
   require("./middleware/auth"),
@@ -37,6 +41,7 @@ app.get(
     });
   }
 );
+
 app.get("/api/health", async (req, res) => {
   try {
     const result = await pool.query(
@@ -49,7 +54,10 @@ app.get("/api/health", async (req, res) => {
       serverTime: result.rows[0].server_time,
     });
   } catch (error) {
-    console.error("Database health check failed:", error.message);
+    console.error(
+      "Database health check failed:",
+      error.message
+    );
 
     res.status(500).json({
       status: "error",
@@ -58,6 +66,14 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`LostLink API running at http://localhost:${PORT}`);
-});
+// Start the server only when this file is run directly.
+// Tests can import the app without automatically opening port 5000.
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(
+      `LostLink API running at http://localhost:${PORT}`
+    );
+  });
+}
+
+module.exports = app;
