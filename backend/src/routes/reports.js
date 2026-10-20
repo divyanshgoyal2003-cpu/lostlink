@@ -189,7 +189,19 @@ if (
       error: "attributes must be a JSON object",
     });
   }
-
+  // Electronics reports must include a structured model.
+  if (category === "ELECTRONICS") {
+    if (
+      typeof attributes.model !== "string" ||
+      attributes.model.trim().length === 0 ||
+      attributes.model.trim().length > 100
+    ) {
+      return res.status(400).json({
+        error:
+          "Model is required for electronics and must be at most 100 characters",
+      });
+    }
+  }
   if (
     typeof reportTime !== "string" ||
     Number.isNaN(Date.parse(reportTime))

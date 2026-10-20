@@ -447,18 +447,21 @@ router.get("/", async (req, res) => {
       [req.user.userId]
     );
 
-    return res.json({
-  count: result.rowCount,
-  matches: result.rows.map((match) => ({
-    matchScore: Number(match.total_score),
-    modelScore: Number(match.model_score),
-    category: match.lost_category,
-    approximateDistanceM: Math.round(Number(match.distance_m) / 100) * 100,
-    daysApart: Number(match.days_apart),
-    status: "CANDIDATE"
-  })),
-  note: "Match scores are estimates, not probabilities or proof of ownership."
-});
+ return res.json({
+      count: result.rowCount,
+      matches: result.rows.map((match) => ({
+        matchScore: Number(match.total_score),
+        modelScore: Number(match.model_score),
+        category: match.lost_category,
+        lostTitle: match.lost_title,
+        foundTitle: match.found_title,
+        approximateDistanceM:
+          Math.round(Number(match.distance_m) / 100) * 100,
+        daysApart: Number(match.days_apart),
+        status: "CANDIDATE",
+      })),
+      note: "Match scores are estimates, not probabilities or proof of ownership.",
+    });
   } catch (error) {
     console.error("Find matches failed:", error.message);
 

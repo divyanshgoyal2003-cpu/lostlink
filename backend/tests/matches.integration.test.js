@@ -144,6 +144,31 @@ async function createReport({
   return reportId;
 }
 
+async function createReportViaApi(overrides = {}) {
+  const payload = {
+    category: "ELECTRONICS",
+    title: "Sony wireless headphones",
+    description: "Integration test report",
+    color: "Black",
+    company: "Sony",
+    attributes: {
+      model: "WH-1000XM5",
+    },
+    reportType: "LOST",
+    reportTime: new Date().toISOString(),
+    latitude: 12.97,
+    longitude: 79.16,
+    locationSource: "MAP_PIN",
+    ...overrides,
+  };
+
+  return api("/api/reports", {
+    method: "POST",
+    authenticated: true,
+    body: JSON.stringify(payload),
+  });
+}
+
 afterEach(async () => {
   if (reportIds.length > 0) {
     await pool.query(
@@ -315,4 +340,60 @@ test("POST /api/matches/refresh persists the production model score", async () =
   assert.equal(persisted.rowCount, 1);
   assert.equal(persisted.rows[0].match_status, "CANDIDATE");
   assert.equal(persisted.rows[0].model_score, "100");
+});
+test("electronics reports reject a missing model", async () => {
+  const response = await createReportViaApi({
+    attributes: {},
+  });
+
+  assert.equal(response.status, 400);
+
+  const body = await response.json();
+  assert.match(body.error, /model is required/i);
+});
+
+test("electronics reports reject a blank model", async () => {
+  const response = await createReportViaApi({
+    attributes: {
+      model: "   ",
+    },
+  });
+
+  assert.equal(response.status, 400);
+});
+
+test("electronics model is stored in attributes_json", async () => {
+  const response = await createReportViaApi();
+
+  const body = await response.json();
+
+  assert.equal(response.status, 201);
+
+  itemIds.push(body.item.item_id);
+  reportIds.push(body.report.report_id);
+
+  const result = await pool.query(
+    `SELECT attributes_json->>'model' AS model
+     FROM items
+     WHERE item_id = $1`,
+    [body.item.item_id]
+  );
+
+  assert.equal(result.rowCount, 1);
+  assert.equal(result.rows[0].model, "WH-1000XM5");
+});
+
+test("non-electronics reports do not require a model", async () => {
+  const response = await createReportViaApi({
+    category: "BAGS",
+    title: "Black backpack",
+    attributes: {},
+  });
+
+  const body = await response.json();
+
+  assert.equal(response.status, 201);
+
+  itemIds.push(body.item.item_id);
+  reportIds.push(body.report.report_id);
 });

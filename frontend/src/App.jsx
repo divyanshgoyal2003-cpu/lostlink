@@ -38,6 +38,7 @@ const [reportForm, setReportForm] = useState({
   description: '',
   color: '',
   company: '',
+  model: '',
   reportType: 'LOST',
   reportTime: '',
   latitude: '',
@@ -165,7 +166,10 @@ title: reportForm.title.trim(),
 description: reportForm.description.trim() || null,
 color: reportForm.color.trim(),
 company: reportForm.company.trim(),
-attributes: {},
+attributes:
+  reportForm.category === 'ELECTRONICS'
+    ? { model: reportForm.model.trim() }
+    : {},
       reportType: reportForm.reportType,
       reportTime: new Date(reportForm.reportTime).toISOString(),
       latitude,
@@ -183,6 +187,7 @@ attributes: {},
       description: '',
      color: '',
       company: '',
+      model: '',
       reportType: reportForm.reportType,
      reportTime: '',
      latitude: '',
@@ -556,7 +561,26 @@ useEffect(() => {
   required
   placeholder="e.g. Navy blue"
 />
-
+{reportForm.category === 'ELECTRONICS' && (
+  <>
+    <label htmlFor="report-model">
+      Model <span aria-hidden="true">*</span>
+    </label>
+    <input
+      id="report-model"
+      value={reportForm.model}
+      onChange={(e) =>
+        setReportForm((previous) => ({
+          ...previous,
+          model: e.target.value,
+        }))
+      }
+      maxLength={100}
+      required
+      placeholder="e.g. WH-1000XM5"
+    />
+  </>
+)}
 <label htmlFor="report-company">Company / Brand</label>
 <input
   id="report-company"
@@ -937,18 +961,37 @@ useEffect(() => {
           </div>
 
           <h3>
-            {match.category?.replaceAll('_', ' ') ||
-              'Possible item match'}
-          </h3>
+  {match.category?.replaceAll('_', ' ') ||
+    'Possible item match'}
+</h3>
 
-          <p>
-            Approximate distance: {match.approximateDistanceM} m
-          </p>
-          <p>Reported times: {match.daysApart} days apart</p>
-          <p>
-            The score is an estimate, not a probability or proof
-            of ownership.
-          </p>
+<p>
+  <strong>Lost item:</strong>{' '}
+  {match.lostTitle || 'Title unavailable'}
+</p>
+
+<p>
+  <strong>Found item:</strong>{' '}
+  {match.foundTitle || 'Title unavailable'}
+</p>
+
+<p>
+  <strong>Model compatibility:</strong>{' '}
+  {Math.round(Number(match.modelScore ?? 50))}/100
+</p>
+
+<p>
+  Approximate distance: {match.approximateDistanceM} m
+</p>
+
+<p>
+  Reported times: {match.daysApart} days apart
+</p>
+
+<p>
+  The score is an estimate, not a probability or proof
+  of ownership.
+</p>
         </article>
       ))}
     </div>
