@@ -62,10 +62,11 @@ router.post("/", authenticateToken, async (req, res) => {
 
   const {
     category,
-    title,
-    description = null,
-    color = null,
-    attributes = {},
+  title,
+  description = null,
+  color,
+  company,
+  attributes = {},
     reportType,
     reportTime,
     latitude,
@@ -141,15 +142,24 @@ router.post("/", authenticateToken, async (req, res) => {
     });
   }
 
-  if (
-    color !== null &&
-    (typeof color !== "string" || color.length > 100)
-  ) {
-    return res.status(400).json({
-      error: "Color must be a string of at most 100 characters",
-    });
-  }
-
+ if (
+  typeof color !== "string" ||
+  color.trim().length === 0 ||
+  color.length > 100
+) {
+  return res.status(400).json({
+    error: "Color is required and must be at most 100 characters",
+  });
+}
+if (
+  typeof company !== "string" ||
+  company.trim().length === 0 ||
+  company.length > 120
+) {
+  return res.status(400).json({
+    error: "Company or brand is required and must be at most 120 characters",
+  });
+}
   if (
     !Number.isFinite(Number(uncertaintyRadiusM)) ||
     Number(uncertaintyRadiusM) < 0 ||
@@ -228,7 +238,10 @@ router.post("/", authenticateToken, async (req, res) => {
         title.trim(),
         description,
         color,
-        JSON.stringify(attributes),
+        JSON.stringify({
+          ...attributes,
+          company: company.trim(),
+        }),
       ]
     );
 
@@ -312,6 +325,7 @@ router.get("/mine", authenticateToken, async (req, res) => {
          i.title,
          i.description,
          i.color,
+         i.attributes_json->>'company' AS company,
          ST_Y(r.location_point::geometry) AS latitude,
          ST_X(r.location_point::geometry) AS longitude,
          r.created_at
@@ -380,15 +394,18 @@ router.patch("/:id", authenticateToken, async (req, res) => {
     });
   }
 
-  if (
-    color !== undefined &&
-    color !== null &&
-    (typeof color !== "string" || color.length > 100)
-  ) {
-    return res.status(400).json({
-      error: "Color must be at most 100 characters",
-    });
-  }
+ if (
+  color !== undefined &&
+  (
+    typeof color !== "string" ||
+    color.trim().length === 0 ||
+    color.length > 100
+  )
+) {
+  return res.status(400).json({
+    error: "Color must be non-empty and at most 100 characters",
+  });
+}
 
   if (
     category !== undefined &&

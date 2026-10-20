@@ -9,7 +9,7 @@ import {
   getMyMatches,
 } from './api'
 import './App.css'
-
+import LocationPicker from './components/LocationPicker'
 function App() {
   const [editingReportId, setEditingReportId] = useState(null)
   const [editReportForm, setEditReportForm] = useState({
@@ -37,13 +37,14 @@ const [reportForm, setReportForm] = useState({
   title: '',
   description: '',
   color: '',
+  company: '',
   reportType: 'LOST',
   reportTime: '',
   latitude: '',
   longitude: '',
   locationDescription: '',
 })
-
+const [uncertaintyRadiusM, setUncertaintyRadiusM] = useState(75)
 const [reportLoading, setReportLoading] = useState(false)
 const [reportMessage, setReportMessage] = useState('')
 const [reportError, setReportError] = useState('')
@@ -160,15 +161,16 @@ async function handleReportSubmit(event) {
 
     const result = await createReport(authToken, {
       category: reportForm.category,
-      title: reportForm.title.trim(),
-      description: reportForm.description.trim() || null,
-      color: reportForm.color.trim() || null,
-      attributes: {},
+title: reportForm.title.trim(),
+description: reportForm.description.trim() || null,
+color: reportForm.color.trim(),
+company: reportForm.company.trim(),
+attributes: {},
       reportType: reportForm.reportType,
       reportTime: new Date(reportForm.reportTime).toISOString(),
       latitude,
       longitude,
-      uncertaintyRadiusM: 75,
+      uncertaintyRadiusM,
       locationAccuracyM: null,
       locationSource: 'MAP_PIN',
       locationDescription: reportForm.locationDescription.trim() || null,
@@ -179,10 +181,11 @@ async function handleReportSubmit(event) {
       category: 'ELECTRONICS',
       title: '',
       description: '',
-      color: '',
+     color: '',
+      company: '',
       reportType: reportForm.reportType,
-      reportTime: '',
-      latitude: '',
+     reportTime: '',
+     latitude: '',
       longitude: '',
       locationDescription: '',
     })
@@ -535,18 +538,40 @@ useEffect(() => {
       setReportForm({ ...reportForm, description: e.target.value })
     }
     rows={3}
-    placeholder="Brand, model, identifying details..."
+    placeholder="Model number, serial number, and other identifying details..."
   />
 
-  <label htmlFor="report-color">Color (optional)</label>
-  <input
-    id="report-color"
-    value={reportForm.color}
-    onChange={(e) =>
-      setReportForm({ ...reportForm, color: e.target.value })
-    }
-    placeholder="e.g. Navy blue"
-  />
+
+<label htmlFor="report-color">Color</label>
+<input
+  id="report-color"
+  value={reportForm.color}
+  onChange={(e) =>
+    setReportForm((previous) => ({
+      ...previous,
+      color: e.target.value,
+    }))
+  }
+  maxLength={100}
+  required
+  placeholder="e.g. Navy blue"
+/>
+
+<label htmlFor="report-company">Company / Brand</label>
+<input
+  id="report-company"
+  value={reportForm.company}
+  onChange={(e) =>
+    setReportForm((previous) => ({
+      ...previous,
+      company: e.target.value,
+    }))
+  }
+  maxLength={120}
+  required
+  placeholder="e.g. Apple, Samsung, Nike, or Generic"
+/>
+
 
   <label htmlFor="report-time">
     When was it {activeTab === 'lost' ? 'lost' : 'found'}?
@@ -561,43 +586,27 @@ useEffect(() => {
     required
   />
 
-  <h4>Approximate location</h4>
-  <p>Enter coordinates for now; a map picker will come later.</p>
 
-  <div className="report-coordinate-grid">
-    <div>
-      <label htmlFor="report-latitude">Latitude</label>
-      <input
-        id="report-latitude"
-        type="number"
-        step="any"
-        min="-90"
-        max="90"
-        value={reportForm.latitude}
-        onChange={(e) =>
-          setReportForm({ ...reportForm, latitude: e.target.value })
-        }
-        required
-        placeholder="Latitude"
-      />
-    </div>
-    <div>
-      <label htmlFor="report-longitude">Longitude</label>
-      <input
-        id="report-longitude"
-        type="number"
-        step="any"
-        min="-180"
-        max="180"
-        value={reportForm.longitude}
-        onChange={(e) =>
-          setReportForm({ ...reportForm, longitude: e.target.value })
-        }
-        required
-        placeholder="Longitude"
-      />
-    </div>
-  </div>
+<h4>Approximate location</h4>
+<p>
+  Select the approximate place where the item was lost or found.
+  The circle represents your location uncertainty.
+</p>
+
+<LocationPicker
+  latitude={reportForm.latitude}
+  longitude={reportForm.longitude}
+  uncertaintyRadiusM={uncertaintyRadiusM}
+  onLocationChange={({ latitude, longitude }) => {
+    setReportForm((previous) => ({
+      ...previous,
+      latitude: String(latitude),
+      longitude: String(longitude),
+    }))
+  }}
+  onRadiusChange={setUncertaintyRadiusM}
+/>
+
 
   <label htmlFor="report-location-description">
     Location description (optional)
@@ -752,6 +761,11 @@ useEffect(() => {
           {report.category && (
             <p className="my-report-category">
               {report.category.replaceAll('_', ' ')}
+            </p>
+          )}
+          {report.company && (
+            <p className="my-report-company">
+               <strong>Company / Brand:</strong> {report.company}
             </p>
           )}
           {report.report_time && (
