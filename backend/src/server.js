@@ -8,6 +8,7 @@ const helmet = require("helmet");
 const pool = require("./config/db");
 const matchesRouter = require("./routes/matches");
 const reportsRouter = require("./routes/reports");
+const claimsRouter = require("./routes/claims");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -23,6 +24,7 @@ app.use(
 );
 
 app.use("/api/reports", reportsRouter);
+app.use("/api/claims", claimsRouter);
 app.use("/api/auth", require("./routes/auth"));
 
 app.get("/", (req, res) => {
