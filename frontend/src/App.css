@@ -905,6 +905,163 @@ a {
   }
 }
 
+/* Sprint 8: filters for authorized matching candidates */
+.match-filters {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  margin: 20px 0 12px;
+  padding: 18px;
+  border: 1px solid #dbe6df;
+  border-radius: 16px;
+  background: #f7faf7;
+}
+
+.match-filters > div,
+.match-filters fieldset {
+  min-width: 0;
+}
+
+.match-filter-actions {
+  display: flex;
+  align-items: end;
+  gap: 10px;
+  grid-column: span 2;
+}
+
+.match-filter-actions .btn {
+  min-height: 42px;
+  flex: 1;
+}
+
+.match-filters fieldset {
+  grid-column: span 2;
+}
+
+.match-lost-report-filter {
+  grid-column: span 2;
+}
+
+.match-filter-hint {
+  display: block;
+  margin-top: 6px;
+  color: #52645d;
+}
+
+.match-filters label,
+.match-filters legend {
+  display: block;
+  margin-bottom: 6px;
+  color: #29463e;
+  font-size: 0.88rem;
+  font-weight: 700;
+}
+
+.match-filters input,
+.match-filters select {
+  width: 100%;
+  min-height: 42px;
+  padding: 8px 10px;
+  border: 1px solid #cbd8d0;
+  border-radius: 9px;
+  background: #fff;
+  color: #203a33;
+  font: inherit;
+}
+
+.match-filters fieldset {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 7px 10px;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid #d4e0d8;
+  border-radius: 10px;
+}
+
+.match-filters fieldset legend {
+  padding: 0 5px;
+}
+
+.match-filters fieldset label {
+  margin: 0;
+  font-weight: 500;
+}
+
+.match-filters input:focus-visible,
+.match-filters select:focus-visible,
+.match-filters button:focus-visible {
+  outline: 3px solid #66a98a;
+  outline-offset: 2px;
+}
+
+.match-filter-count {
+  margin: 8px 0 16px;
+  color: #52645d;
+}
+
+.match-result-card > p {
+  margin: 0 0 8px;
+  color: #52645d;
+  line-height: 1.5;
+}
+
+.match-claim-action {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.match-claim-action .claim-status {
+  margin: 0;
+}
+
+.match-ineligible-note {
+  color: #77520d !important;
+  font-weight: 600;
+}
+
+@media (max-width: 900px) {
+  .match-filters {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .match-filters fieldset {
+    grid-column: span 1;
+  }
+
+  .match-lost-report-filter {
+    grid-column: span 1;
+  }
+}
+
+@media (max-width: 560px) {
+  .match-filters {
+    grid-template-columns: 1fr;
+  }
+
+  .match-filter-actions {
+    grid-column: auto;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .match-filters fieldset {
+    grid-column: auto;
+  }
+
+  .match-lost-report-filter {
+    grid-column: auto;
+  }
+
+  .match-filter-actions .btn {
+    width: 100%;
+  }
+}
+
 /* Report form */
 .report-form {
   display: flex;

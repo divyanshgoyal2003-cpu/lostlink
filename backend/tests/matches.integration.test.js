@@ -15,6 +15,7 @@ let server;
 let baseUrl;
 let token;
 let userId;
+const otherUserIds = [];
 
 const reportIds = [];
 const itemIds = [];
@@ -22,8 +23,8 @@ const itemIds = [];
 async function api(path, options = {}) {
   const headers = {
     ...(options.body ? { "Content-Type": "application/json" } : {}),
-    ...(options.authenticated && token
-      ? { Authorization: `Bearer ${token}` }
+    ...(options.token || (options.authenticated && token)
+      ? { Authorization: `Bearer ${options.token || token}` }
       : {}),
     ...options.headers,
   };
@@ -90,6 +91,7 @@ async function createReport({
   brand,
   model,
   color = "Black",
+  ownerId = userId,
 }) {
   const attributes = {};
 
@@ -135,7 +137,7 @@ async function createReport({
        100, 'MAP_PIN', 'Integration test location'
      )
      RETURNING report_id`,
-    [userId, itemId, reportType, 79.16, 12.97]
+    [ownerId, itemId, reportType, 79.16, 12.97]
   );
 
   const reportId = reportResult.rows[0].report_id;
@@ -204,6 +206,9 @@ after(async () => {
     if (userId !== undefined) {
       await pool.query("DELETE FROM users WHERE user_id = $1", [userId]);
     }
+    if (otherUserIds.length > 0) {
+      await pool.query("DELETE FROM users WHERE user_id = ANY($1::bigint[])", [otherUserIds]);
+    }
   } finally {
     await pool.end();
   }
@@ -213,6 +218,124 @@ test("GET /api/matches rejects requests without authentication", async () => {
   const response = await api("/api/matches");
 
   assert.equal(response.status, 401);
+});
+
+test("general report browsing is retired and does not expose arbitrary report details", async () => {
+  const createResponse = await createReportViaApi({
+    title: "Private discovery title sentinel",
+    description: "Private discovery description sentinel",
+  });
+  const created = await createResponse.json();
+  assert.equal(createResponse.status, 201);
+  reportIds.push(created.report.report_id);
+  itemIds.push(created.item.item_id);
+
+  const noAuth = await api("/api/reports?search=sentinel");
+  assert.equal(noAuth.status, 401);
+
+  const response = await api("/api/reports", { authenticated: true });
+  assert.equal(response.status, 410);
+  const body = await response.json();
+  assert.equal(JSON.stringify(body).includes("Private discovery title sentinel"), false);
+  assert.equal(JSON.stringify(body).includes("Private discovery description sentinel"), false);
+});
+
+test("My Reports remains owner-scoped after general browsing is retired", async () => {
+  const createResponse = await createReportViaApi({
+    title: "Owner report management test",
+    description: "Owner-only description",
+  });
+  assert.equal(createResponse.status, 201);
+  const created = await createResponse.json();
+  reportIds.push(created.report.report_id);
+  itemIds.push(created.item.item_id);
+
+  const response = await api("/api/reports/mine", { authenticated: true });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.ok(body.reports.some((report) => String(report.report_id) === String(created.report.report_id)));
+  assert.ok(body.reports.some((report) => report.title === "Owner report management test"));
+});
+
+test("My Matches never returns found-item free text that could reveal verification details", async () => {
+  await createReport({
+    reportType: "LOST",
+    title: "Sony Bluetooth headphones",
+    brand: "Sony",
+    model: "WH-1000XM5",
+  });
+
+  await createReport({
+    reportType: "FOUND",
+    title: "FOUND PRIVATE SERIAL SENTINEL ZX-SECRET-917",
+    brand: "Sony",
+    model: "WH-1000XM5",
+  });
+
+  const response = await api("/api/matches", { authenticated: true });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.count, 1);
+  assert.equal(Object.hasOwn(body.matches[0], "foundTitle"), false);
+  assert.equal(JSON.stringify(body).includes("ZX-SECRET-917"), false);
+});
+
+test("selected lost report filters matches on the backend and returns only that owner's pairs", async () => {
+  const selectedLostId = await createReport({
+    reportType: "LOST",
+    title: "Sony WH-1000XM5 headphones",
+    brand: "Sony",
+    model: "WH-1000XM5",
+  });
+  await createReport({
+    reportType: "LOST",
+    title: "Sony WH-1000XM5 headphones second report",
+    brand: "Sony",
+    model: "WH-1000XM5",
+  });
+  await createReport({
+    reportType: "FOUND",
+    title: "Found Sony headphones",
+    brand: "Sony",
+    model: "WH-1000XM5",
+  });
+
+  const allResponse = await api("/api/matches", { authenticated: true });
+  assert.equal(allResponse.status, 200);
+  const allBody = await allResponse.json();
+  assert.equal(allBody.count, 2);
+
+  const selectedResponse = await api(`/api/matches?lostReportId=${selectedLostId}`, { authenticated: true });
+  assert.equal(selectedResponse.status, 200);
+  const selectedBody = await selectedResponse.json();
+  assert.equal(selectedBody.count, 1);
+  assert.equal(selectedBody.matches[0].lostTitle, "Sony WH-1000XM5 headphones");
+  assert.equal(Object.hasOwn(selectedBody.matches[0], "lostReportId"), false);
+});
+
+test("a forged lost report ID cannot expose another user's matches", async () => {
+  const registration = await api("/api/auth/register", {
+    method: "POST",
+    body: JSON.stringify({
+      name: "Other Match Owner",
+      email: `lostlink-other-${process.pid}-${Date.now()}@example.test`,
+      password: "Integration-Test-Password-123",
+    }),
+  });
+  assert.equal(registration.status, 201);
+  const otherUser = await registration.json();
+  otherUserIds.push(otherUser.user.user_id);
+
+  const foreignLostId = await createReport({
+    reportType: "LOST",
+    title: "Other user's private lost report",
+    ownerId: otherUser.user.user_id,
+  });
+
+  const response = await api(`/api/matches?lostReportId=${foreignLostId}`, { authenticated: true });
+  assert.equal(response.status, 404);
+  const body = await response.json();
+  assert.equal(JSON.stringify(body).includes("Other user's private lost report"), false);
 });
 
 test("production SQL rejects mismatched brands and scores identical models", async () => {

@@ -18,39 +18,12 @@ const VALID_REPORT_TYPES = ["LOST", "FOUND"];
 const VALID_LOCATION_SOURCES = ["GPS", "MAP_PIN"];
 
 // GET /api/reports
-// Retrieve open reports, newest first.
-// We will restrict this endpoint separately before exposing private details.
-
-router.get("/", authenticateToken, async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT
-        r.report_id,
-        r.report_type,
-        r.report_time,
-        r.status,
-        i.category,
-        i.title,
-        i.color,
-        r.created_at
-      FROM reports r
-      JOIN items i ON i.item_id = r.item_id
-      WHERE r.status = 'OPEN'
-      ORDER BY r.created_at DESC
-      LIMIT 100
-    `);
-
-    return res.json({
-      count: result.rowCount,
-      reports: result.rows
-    });
-  } catch (error) {
-    console.error("Get reports failed:", error.message);
-
-    return res.status(500).json({
-      error: "Unable to retrieve reports"
-    });
-  }
+// General report browsing is retired. Use the authorized My Matches workflow
+// for candidate discovery and /mine for owner-scoped report management.
+router.get("/", authenticateToken, (req, res) => {
+  return res.status(410).json({
+    error: "General report browsing is unavailable. Use My Matches to find qualifying candidates.",
+  });
 });
 
 

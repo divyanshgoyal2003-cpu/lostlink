@@ -13,9 +13,11 @@ export async function apiRequest(path, options = {}) {
   const data = await response.json().catch(() => ({}))
 
   if (!response.ok) {
-    throw new Error(
+    const error = new Error(
       data.error || data.message || `Request failed (${response.status})`,
     )
+    error.status = response.status
+    throw error
   }
 
   return data
@@ -58,7 +60,6 @@ export async function getMyReports(token) {
   return authenticatedRequest('/reports/mine', token)
 }
 
-
 export async function updateReport(token, reportId, report) {
   return authenticatedRequest(`/reports/${reportId}`, token, {
     method: 'PATCH',
@@ -73,6 +74,61 @@ export async function closeReport(token, reportId) {
 }
 
 
-export async function getMyMatches(token) {
-  return authenticatedRequest('/matches', token)
+export async function getMyMatches(token, lostReportId = '') {
+  const query = lostReportId
+    ? `?lostReportId=${encodeURIComponent(lostReportId)}`
+    : ''
+  return authenticatedRequest(`/matches${query}`, token)
+}
+
+export async function refreshMatchCandidates(token) {
+  return authenticatedRequest('/matches/refresh', token, {
+    method: 'POST',
+  })
+}
+
+export async function getMyClaims(token) {
+  return authenticatedRequest('/claims', token)
+}
+
+export async function submitClaim(token, matchId) {
+  return authenticatedRequest('/claims', token, {
+    method: 'POST',
+    body: JSON.stringify({ matchId }),
+  })
+}
+
+export async function getClaimReviewQueue(token) {
+  return authenticatedRequest('/claims/review-queue', token)
+}
+
+export async function getClaimVerifications(token, claimId) {
+  return authenticatedRequest(`/claims/${claimId}/verifications`, token)
+}
+
+export async function submitClaimVerification(token, claimId, verification) {
+  return authenticatedRequest(`/claims/${claimId}/verifications`, token, {
+    method: 'POST',
+    body: JSON.stringify(verification),
+  })
+}
+
+export async function reviewClaim(token, claimId, decision, privateNote) {
+  return authenticatedRequest(`/claims/${claimId}/review`, token, {
+    method: 'PATCH',
+    body: JSON.stringify({ decision, privateNote }),
+  })
+}
+
+export async function issueHandoverCode(token, claimId) {
+  return authenticatedRequest(`/claims/${claimId}/handover/code`, token, {
+    method: 'POST',
+  })
+}
+
+export async function confirmHandover(token, claimId, code) {
+  return authenticatedRequest(`/claims/${claimId}/handover/confirm`, token, {
+    method: 'POST',
+    body: JSON.stringify({ code }),
+  })
 }

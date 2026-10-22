@@ -1,6 +1,11 @@
 
 const express = require("express");
 const pool = require("../config/db");
+const {
+  MATCH_SCORE_THRESHOLD,
+  STRONG_MATCH_THRESHOLD,
+  getMatchStrength,
+} = require("../config/matching");
 
 const router = express.Router();
 
@@ -79,6 +84,8 @@ const candidateQuery = `
     LEFT JOIN electronics fe ON fe.item_id = fi.item_id
 
     WHERE l.report_type = 'LOST'
+      AND l.user_id = $1
+      AND ($2::bigint IS NULL OR l.report_id = $2::bigint)
       AND l.status = 'OPEN'
       AND l.report_id <> f.report_id
 
@@ -380,14 +387,16 @@ const candidateQuery = `
       END AS description_score
 
     FROM text_features
-  )
-
-  SELECT
+  ), scored_candidates AS (
+    SELECT
     lost_report_id,
     found_report_id,
 
     lost_title,
     found_title,
+
+    lost_report_time,
+    found_report_time,
 
     lost_category,
     found_category,
@@ -421,11 +430,15 @@ const candidateQuery = `
       2
     ) AS total_score
 
-  FROM scored
+    FROM scored
 
-  -- Geographic compatibility is checked after item filtering.
-  WHERE circles_overlap = TRUE
+    -- Geographic compatibility is checked after item filtering.
+    WHERE circles_overlap = TRUE
+  )
 
+  SELECT *
+  FROM scored_candidates
+  WHERE total_score >= ${MATCH_SCORE_THRESHOLD}
   ORDER BY total_score DESC, distance_m ASC
   LIMIT 100
 `;
@@ -434,31 +447,73 @@ const candidateQuery = `
 // Read-only: calculates candidates without modifying match_records.
 
 router.get("/", async (req, res) => {
+  const rawLostReportId = req.query.lostReportId;
+  let selectedLostReportId = null;
+  if (rawLostReportId !== undefined && rawLostReportId !== "") {
+    const normalizedId = String(rawLostReportId);
+    if (!/^[1-9]\d*$/.test(normalizedId) || !Number.isSafeInteger(Number(normalizedId))) {
+      return res.status(400).json({ error: "Invalid lost report ID" });
+    }
+    selectedLostReportId = normalizedId;
+  }
+
   try {
+    if (selectedLostReportId !== null) {
+      const ownedReport = await pool.query(
+        `SELECT status
+         FROM reports
+         WHERE report_id = $1 AND user_id = $2 AND report_type = 'LOST'`,
+        [selectedLostReportId, req.user.userId]
+      );
+      if (ownedReport.rowCount === 0) {
+        return res.status(404).json({ error: "Lost report not found" });
+      }
+      if (ownedReport.rows[0].status !== "OPEN") {
+        return res.status(409).json({ error: "Selected lost report is not eligible for matching" });
+      }
+    }
+
     const result = await pool.query(
       `
-      SELECT m.*
+      SELECT m.*,
+             saved.match_id AS saved_match_id,
+             saved.match_status AS saved_match_status,
+             saved.calculated_at AS saved_calculated_at,
+             saved.total_score AS saved_total_score,
+             COALESCE(saved.calculated_at, GREATEST(l.created_at, f.created_at)) AS matched_at
       FROM (${candidateQuery}) AS m
       JOIN reports l ON l.report_id = m.lost_report_id
       JOIN reports f ON f.report_id = m.found_report_id
-      WHERE l.user_id = $1 OR f.user_id = $1
+      LEFT JOIN match_records saved
+        ON saved.lost_report_id = m.lost_report_id
+       AND saved.found_report_id = m.found_report_id
+      WHERE l.user_id = $1
+        AND (saved.match_id IS NULL OR saved.total_score >= ${MATCH_SCORE_THRESHOLD})
       ORDER BY m.total_score DESC, m.distance_m ASC
       `,
-      [req.user.userId]
+      [req.user.userId, selectedLostReportId]
     );
 
  return res.json({
       count: result.rowCount,
+      scoreThreshold: MATCH_SCORE_THRESHOLD,
+      strongMatchThreshold: STRONG_MATCH_THRESHOLD,
       matches: result.rows.map((match) => ({
+        matchId: match.saved_match_id == null ? null : String(match.saved_match_id),
         matchScore: Number(match.total_score),
+        matchStrength: getMatchStrength(Number(match.total_score)),
         modelScore: Number(match.model_score),
         category: match.lost_category,
         lostTitle: match.lost_title,
-        foundTitle: match.found_title,
+        lostReportTime: match.lost_report_time,
+        foundReportTime: match.found_report_time,
+        matchedAt: match.matched_at,
         approximateDistanceM:
           Math.round(Number(match.distance_m) / 100) * 100,
         daysApart: Number(match.days_apart),
-        status: "CANDIDATE",
+        status: match.saved_match_status || "CANDIDATE",
+        canClaim: match.saved_match_id != null &&
+          ["CANDIDATE", "CHAT_ENABLED"].includes(match.saved_match_status || "CANDIDATE"),
       })),
       note: "Match scores are estimates, not probabilities or proof of ownership.",
     });
@@ -489,7 +544,7 @@ router.post("/refresh", async (req, res) => {
     );
 
     // Recalculate eligible candidates using the shared matching query.
-    const candidateResult = await client.query(candidateQuery);
+    const candidateResult = await client.query(candidateQuery, [req.user.userId, null]);
     const candidates = candidateResult.rows;
 
     // Keep track of the candidate pairs returned by this refresh.
@@ -567,6 +622,11 @@ router.post("/refresh", async (req, res) => {
       UPDATE match_records mr
       SET match_status = 'STALE'
       WHERE mr.match_status = 'CANDIDATE'
+        AND EXISTS (
+          SELECT 1 FROM reports owned_lost
+          WHERE owned_lost.report_id = mr.lost_report_id
+            AND owned_lost.user_id = $1
+        )
         AND NOT EXISTS (
           SELECT 1
           FROM reports l
@@ -579,7 +639,8 @@ router.post("/refresh", async (req, res) => {
             AND l.status = 'OPEN'
             AND f.status = 'OPEN'
         )
-      `
+      `,
+      [req.user.userId]
     );
 
     // Stale any remaining candidates that are no longer in the result set.
@@ -590,7 +651,13 @@ router.post("/refresh", async (req, res) => {
         UPDATE match_records
         SET match_status = 'STALE'
         WHERE match_status = 'CANDIDATE'
-        `
+          AND EXISTS (
+            SELECT 1 FROM reports owned_lost
+            WHERE owned_lost.report_id = match_records.lost_report_id
+              AND owned_lost.user_id = $1
+          )
+        `,
+        [req.user.userId]
       );
 
       staleResult.rowCount += emptyResult.rowCount;
@@ -600,6 +667,11 @@ router.post("/refresh", async (req, res) => {
         UPDATE match_records mr
         SET match_status = 'STALE'
         WHERE mr.match_status = 'CANDIDATE'
+          AND EXISTS (
+            SELECT 1 FROM reports owned_lost
+            WHERE owned_lost.report_id = mr.lost_report_id
+              AND owned_lost.user_id = $2
+          )
           AND NOT EXISTS (
             SELECT 1
             FROM jsonb_to_recordset($1::jsonb)
@@ -608,7 +680,7 @@ router.post("/refresh", async (req, res) => {
               AND cp.found_report_id = mr.found_report_id
           )
         `,
-        [JSON.stringify(candidatePairs)]
+        [JSON.stringify(candidatePairs), req.user.userId]
       );
 
       staleResult.rowCount += stalePairsResult.rowCount;

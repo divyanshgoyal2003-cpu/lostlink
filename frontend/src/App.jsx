@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   loginUser,
   registerUser,
@@ -7,9 +7,26 @@ import {
   updateReport,
   closeReport,
   getMyMatches,
+  refreshMatchCandidates,
+  getMyClaims,
+  submitClaim,
 } from './api'
 import './App.css'
 import LocationPicker from './components/LocationPicker'
+import ClaimWorkflow from './components/ClaimWorkflow'
+import { filterAndSortMatches } from './matchFilters'
+import { getMatchClaimState } from './claimCardState'
+
+const DEFAULT_MATCH_FILTERS = {
+  keyword: '',
+  category: '',
+  strength: 'ALL',
+  lostReportId: '',
+  foundDateFrom: '',
+  foundDateTo: '',
+  sort: 'score',
+}
+
 function App() {
   const [editingReportId, setEditingReportId] = useState(null)
   const [editReportForm, setEditReportForm] = useState({
@@ -57,6 +74,15 @@ const [myMatches, setMyMatches] = useState([])
 const [matchesLoading, setMatchesLoading] = useState(false)
 const [matchesError, setMatchesError] = useState('')
 const [matchesMessage, setMatchesMessage] = useState('')
+const [matchScoreThreshold, setMatchScoreThreshold] = useState(null)
+const [strongMatchThreshold, setStrongMatchThreshold] = useState(null)
+const [matchFilters, setMatchFilters] = useState({ ...DEFAULT_MATCH_FILTERS })
+const [appliedMatchFilters, setAppliedMatchFilters] = useState({ ...DEFAULT_MATCH_FILTERS })
+const [claimsForMatches, setClaimsForMatches] = useState([])
+const [claimsLoaded, setClaimsLoaded] = useState(false)
+const [claimSubmittingMatchId, setClaimSubmittingMatchId] = useState('')
+const [claimCardMessages, setClaimCardMessages] = useState({})
+const claimSubmissionLocks = useRef(new Set())
 
 const [currentUser, setCurrentUser] = useState(() => {
   try {
@@ -220,11 +246,13 @@ attributes:
   }
 }
 
-async function loadMyMatches() {
+async function loadMyMatches({ refresh = false, lostReportId = appliedMatchFilters.lostReportId } = {}) {
   if (!authToken) {
     setMyMatches([])
+      setMatchScoreThreshold(null)
+      setStrongMatchThreshold(null)
     setMatchesError('Please log in to view your matches.')
-    return
+    return false
   }
 
   setMatchesLoading(true)
@@ -232,18 +260,80 @@ async function loadMyMatches() {
   setMatchesMessage('')
 
   try {
-    const result = await getMyMatches(authToken)
+    if (refresh) {
+      await refreshMatchCandidates(authToken)
+    }
+    const result = await getMyMatches(authToken, lostReportId)
     setMyMatches(result.matches || [])
+    setMatchScoreThreshold(result.scoreThreshold ?? null)
+    setStrongMatchThreshold(result.strongMatchThreshold ?? null)
 
     if (!result.matches?.length) {
       setMatchesMessage(
         'No potential matches are available for your reports yet.'
       )
     }
+    return true
   } catch (error) {
     setMatchesError(error.message || 'Could not load your matches.')
+    return false
   } finally {
     setMatchesLoading(false)
+  }
+}
+
+async function refreshClaimRelatedData() {
+  await Promise.all([loadMyReports(), loadMyMatches()])
+}
+
+async function refreshClaimsForMatches() {
+  if (!authToken) {
+    setClaimsForMatches([])
+    setClaimsLoaded(false)
+    return false
+  }
+  try {
+    const result = await getMyClaims(authToken)
+    setClaimsForMatches(result.claims || [])
+    setClaimsLoaded(true)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function handleClaimsChange(claims, loaded) {
+  setClaimsForMatches(claims)
+  setClaimsLoaded(loaded)
+}
+
+async function handleCardClaim(match) {
+  const matchId = String(match.matchId)
+  const state = getMatchClaimState(match, claimsForMatches, claimsLoaded)
+  if (!authToken || state.type !== 'submit' || claimSubmissionLocks.current.has(matchId)) return
+
+  claimSubmissionLocks.current.add(matchId)
+  setClaimSubmittingMatchId(matchId)
+  setClaimCardMessages((previous) => ({ ...previous, [matchId]: '' }))
+  try {
+    const confirmed = window.confirm(
+      `Submit a claim for “${match.lostTitle || 'this lost item'}”? A staff member will review it. If approved, you will confirm the handover with a one-time code.`,
+    )
+    if (!confirmed) return
+
+    const result = await submitClaim(authToken, match.matchId)
+    setClaimsForMatches((previous) => [
+      result.claim,
+      ...previous.filter((claim) => String(claim.claim_id) !== String(result.claim.claim_id)),
+    ])
+    setClaimsLoaded(true)
+    setClaimCardMessages((previous) => ({ ...previous, [matchId]: 'Claim submitted. Track its status under My Claims.' }))
+    await Promise.all([refreshClaimsForMatches(), refreshClaimRelatedData()])
+  } catch (error) {
+    setClaimCardMessages((previous) => ({ ...previous, [matchId]: error.message || 'Could not submit the claim. Please try again.' }))
+  } finally {
+    claimSubmissionLocks.current.delete(matchId)
+    setClaimSubmittingMatchId('')
   }
 }
 
@@ -316,6 +406,19 @@ useEffect(() => {
   }
 }, [authToken])
 
+const filteredMatches = filterAndSortMatches(myMatches, appliedMatchFilters)
+const eligibleLostReports = myReports.filter((report) =>
+  report.report_type === 'LOST' && report.status === 'OPEN'
+)
+const selectedLostReport = myReports.find((report) =>
+  String(report.report_id) === String(appliedMatchFilters.lostReportId)
+)
+
+function updateMatchFilter(event) {
+  const { name, value } = event.target
+  setMatchFilters((previous) => ({ ...previous, [name]: value }))
+}
+
   return (
     <div className="app">
       <header className="navbar">
@@ -326,6 +429,7 @@ useEffect(() => {
 
         <nav className="nav-links">
           <a href="#how-it-works">How it works</a>
+          <a href="#my-matches">My Matches</a>
           <a href="#safety">Safety</a>
         </nav>
 
@@ -338,7 +442,7 @@ useEffect(() => {
 <button
   className="btn btn-ghost"
   onClick={async () => {
-    await loadMyMatches()
+    await loadMyMatches({ refresh: true })
     document.getElementById('my-matches')?.scrollIntoView({
       behavior: 'smooth',
     })
@@ -346,6 +450,10 @@ useEffect(() => {
 >
   My matches
 </button>
+<a className="btn btn-ghost" href="#my-claims">My claims</a>
+{['STAFF', 'ADMIN'].includes(currentUser.role) && (
+  <a className="btn btn-ghost" href="#claim-review">Review claims</a>
+)}
 <button
   className="btn btn-ghost"
   onClick={() => {
@@ -353,6 +461,14 @@ useEffect(() => {
     setAuthToken(null)
     setCurrentUser(null)
     setMyReports([])
+    setMyMatches([])
+    setMatchScoreThreshold(null)
+    setStrongMatchThreshold(null)
+    setMatchFilters({ ...DEFAULT_MATCH_FILTERS })
+    setAppliedMatchFilters({ ...DEFAULT_MATCH_FILTERS })
+    setClaimsForMatches([])
+    setClaimsLoaded(false)
+    setClaimCardMessages({})
     setAuthMessage('You have been logged out.')
   }}
 >
@@ -925,78 +1041,196 @@ useEffect(() => {
       <p className="auth-error">{matchesError}</p>
       <button
         className="btn btn-secondary"
-        onClick={loadMyMatches}
+        onClick={() => loadMyMatches({ refresh: true })}
       >
         Try again
       </button>
     </div>
-  ) : myMatches.length === 0 ? (
-    <div className="my-reports-empty">
-      <div className="placeholder-icon">⌕</div>
-      <h3>No potential matches yet</h3>
-      <p>
-        Potential matches for your reports will appear here when available.
-      </p>
-      <button
-        className="btn btn-primary"
-        onClick={loadMyMatches}
-      >
-        Check matches
-      </button>
-    </div>
   ) : (
-    <div className="my-reports-list">
-      {myMatches.map((match, index) => (
-        <article
-          className="my-report-card"
-          key={`${match.category}-${index}`}
-        >
-          <div className="my-report-card-top">
-            <span className="report-type-badge">
-              POTENTIAL MATCH
-            </span>
-            <span className="my-report-status">
-              Score: {Math.round(match.matchScore)}/100
-            </span>
-          </div>
+    <>
+      <form
+        className="match-filters"
+        onSubmit={async (event) => {
+          event.preventDefault()
+          const loaded = await loadMyMatches({ lostReportId: matchFilters.lostReportId })
+          if (loaded) setAppliedMatchFilters({ ...matchFilters })
+        }}
+        aria-label="Filter My Matches"
+      >
+        <div>
+          <label htmlFor="match-keyword">Keyword</label>
+          <input id="match-keyword" name="keyword" value={matchFilters.keyword} onChange={updateMatchFilter} placeholder="Your lost-item title or category" />
+        </div>
+        <div>
+          <label htmlFor="match-category">Category</label>
+          <select id="match-category" name="category" value={matchFilters.category} onChange={updateMatchFilter}>
+            <option value="">All categories</option>
+            {['ELECTRONICS', 'DOC_CARDS', 'ACCESSORIES', 'CLOTHING', 'BAGS', 'OTHER'].map((category) => (
+              <option value={category} key={category}>{category.replaceAll('_', ' ')}</option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label htmlFor="match-strength">Match strength</label>
+          <select id="match-strength" name="strength" value={matchFilters.strength} onChange={updateMatchFilter}>
+            <option value="ALL">All qualifying matches</option>
+            <option value="POTENTIAL">
+              {matchScoreThreshold != null && strongMatchThreshold != null
+                ? `Potential (${matchScoreThreshold}–${(strongMatchThreshold - 0.01).toFixed(2)})`
+                : 'Potential'}
+            </option>
+            <option value="STRONG">
+              {strongMatchThreshold != null ? `Strong (${strongMatchThreshold}+)` : 'Strong'}
+            </option>
+          </select>
+        </div>
+        <div>
+          <label htmlFor="match-sort">Sort by</label>
+          <select id="match-sort" name="sort" value={matchFilters.sort} onChange={updateMatchFilter}>
+            <option value="score">Highest score</option>
+            <option value="newest">Newest match</option>
+          </select>
+        </div>
+        <div className="match-lost-report-filter">
+          <label htmlFor="match-lost-report">Lost report</label>
+          <select
+            id="match-lost-report"
+            name="lostReportId"
+            value={matchFilters.lostReportId}
+            onChange={updateMatchFilter}
+          >
+            <option value="">All eligible lost reports</option>
+            {eligibleLostReports.map((report) => (
+              <option value={report.report_id} key={report.report_id}>
+                {(report.title || 'Untitled lost report')} · {new Date(report.report_time).toLocaleDateString()}
+              </option>
+            ))}
+          </select>
+          {eligibleLostReports.length === 0 && (
+            <small className="match-filter-hint">Only your open lost reports can be selected.</small>
+          )}
+        </div>
+        <fieldset>
+          <legend>Found report date</legend>
+          <label htmlFor="found-date-from">From</label>
+          <input id="found-date-from" name="foundDateFrom" type="date" value={matchFilters.foundDateFrom} onChange={updateMatchFilter} />
+          <label htmlFor="found-date-to">Through</label>
+          <input id="found-date-to" name="foundDateTo" type="date" value={matchFilters.foundDateTo} onChange={updateMatchFilter} />
+        </fieldset>
+        <div className="match-filter-actions">
+          <button className="btn btn-primary" type="submit">Apply filters</button>
+          <button
+            className="btn btn-secondary"
+            type="button"
+            onClick={() => {
+              const clearedFilters = { ...DEFAULT_MATCH_FILTERS }
+              setMatchFilters(clearedFilters)
+              loadMyMatches({ lostReportId: '' }).then((loaded) => {
+                if (loaded) setAppliedMatchFilters(clearedFilters)
+              })
+            }}
+          >
+            Clear filters
+          </button>
+        </div>
+      </form>
 
-          <h3>
-  {match.category?.replaceAll('_', ' ') ||
-    'Possible item match'}
-</h3>
+      <p className="match-filter-count" role="status">
+        {selectedLostReport && (
+          <strong className="selected-lost-report">
+            Matches for {selectedLostReport.title || 'Untitled lost report'} · {new Date(selectedLostReport.report_time).toLocaleDateString()}.{' '}
+          </strong>
+        )}
+        Showing {filteredMatches.length} of {myMatches.length} qualifying matches (up to 100 are loaded).
+      </p>
 
-<p>
-  <strong>Lost item:</strong>{' '}
-  {match.lostTitle || 'Title unavailable'}
-</p>
-
-<p>
-  <strong>Found item:</strong>{' '}
-  {match.foundTitle || 'Title unavailable'}
-</p>
-
-<p>
-  <strong>Model compatibility:</strong>{' '}
-  {Math.round(Number(match.modelScore ?? 50))}/100
-</p>
-
-<p>
-  Approximate distance: {match.approximateDistanceM} m
-</p>
-
-<p>
-  Reported times: {match.daysApart} days apart
-</p>
-
-<p>
-  The score is an estimate, not a probability or proof
-  of ownership.
-</p>
-        </article>
-      ))}
-    </div>
+      {filteredMatches.length === 0 ? (
+        <div className="my-reports-empty">
+          <div className="placeholder-icon">⌕</div>
+          <h3>No qualifying matches for these filters</h3>
+          <p>
+            {matchScoreThreshold == null
+              ? 'No candidates currently meet the matching threshold. Try another lost report or check again after new reports are added.'
+              : `No candidates currently score ${matchScoreThreshold}/100 or higher for these filters. Try another lost report or clear filters.`}
+          </p>
+          <button className="btn btn-primary" onClick={() => loadMyMatches({ refresh: true })}>
+            Check matches
+          </button>
+        </div>
+      ) : (
+        <div className="my-reports-list">
+          {filteredMatches.map((match, index) => (
+            <article className="my-report-card match-result-card" key={match.matchId || `${match.category}-${index}`}>
+              <div className="my-report-card-top">
+                <span className="report-type-badge">{match.matchStrength === 'STRONG' ? 'STRONG MATCH' : 'POTENTIAL MATCH'}</span>
+                <span className="my-report-status">Score: {Number(match.matchScore).toFixed(2)}/100</span>
+              </div>
+              <h3>{match.category?.replaceAll('_', ' ') || 'Possible item match'}</h3>
+              <p><strong>Lost item:</strong> {match.lostTitle || 'Title unavailable'}</p>
+              <p><strong>Found item details:</strong> Hidden to protect ownership-verification details.</p>
+              <p><strong>Lost report date:</strong> {new Date(match.lostReportTime).toLocaleDateString()}</p>
+              <p><strong>Found report date:</strong> {new Date(match.foundReportTime).toLocaleDateString()}</p>
+              <p>Approximate distance: {match.approximateDistanceM} m · {match.daysApart} days apart</p>
+              <p>Score measures similarity, not probability of ownership. It never approves a claim automatically.</p>
+              {(() => {
+                if (!currentUser || !authToken) {
+                  return <p className="claim-muted">Log in to submit a claim.</p>
+                }
+                const claimState = getMatchClaimState(match, claimsForMatches, claimsLoaded)
+                const matchId = String(match.matchId ?? '')
+                if (claimState.type === 'loading') {
+                  return <p className="claim-muted" role="status">Checking claim status…</p>
+                }
+                if (claimState.type === 'existing') {
+                  return (
+                    <div className="match-claim-action">
+                      <p className="claim-status" role="status">{claimState.label}</p>
+                      <a className="btn btn-secondary" href="#my-claims" aria-label={`View claim ${claimState.claim.claim_id} status`}>
+                        View claim status
+                      </a>
+                    </div>
+                  )
+                }
+                if (claimState.type === 'submit') {
+                  return (
+                    <div className="match-claim-action">
+                      <button
+                        type="button"
+                        className="btn btn-primary"
+                        aria-label={`Claim this item: ${match.lostTitle || match.category || 'matched item'}`}
+                        disabled={claimSubmittingMatchId === matchId}
+                        onClick={() => handleCardClaim(match)}
+                      >
+                        {claimSubmittingMatchId === matchId ? 'Submitting…' : 'Claim this item'}
+                      </button>
+                    </div>
+                  )
+                }
+                if (claimState.type === 'unsaved') {
+                  return <p className="match-ineligible-note">Refresh matches before submitting a claim.</p>
+                }
+                return <p className="match-ineligible-note">This match is not currently eligible for a claim.</p>
+              })()}
+              {claimCardMessages[String(match.matchId)] && (
+                <p className={claimCardMessages[String(match.matchId)].startsWith('Claim submitted') ? 'claim-feedback' : 'auth-error'} role={claimCardMessages[String(match.matchId)].startsWith('Claim submitted') ? 'status' : 'alert'}>
+                  {claimCardMessages[String(match.matchId)]}
+                </p>
+              )}
+              {!match.canClaim && <p className="match-ineligible-note">This candidate is not currently claimable. Refresh matches to check its current state.</p>}
+            </article>
+          ))}
+        </div>
+      )}
+    </>
   )}
 </section>
+<ClaimWorkflow
+  token={authToken}
+  user={currentUser}
+  claims={claimsForMatches}
+  onClaimsChange={handleClaimsChange}
+  onRefresh={refreshClaimRelatedData}
+/>
         <section className="safety-banner" id="safety">
           <div className="safety-icon">⌑</div>
           <div>
