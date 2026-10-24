@@ -43,12 +43,13 @@ async function canReviewClaim(client, userId, claimId) {
   const actor = await currentUser(client, userId);
   if (!actor || actor.account_status !== "ACTIVE") return false;
   const claim = await client.query(
-    `SELECT f.report_id, f.authority_id
+    `SELECT f.report_id, f.authority_id, f.user_id AS found_owner_id, f.recovery_mode
      FROM claim_requests c JOIN match_records m ON m.match_id=c.match_id
      JOIN reports f ON f.report_id=m.found_report_id WHERE c.claim_id=$1`,
     [claimId]
   );
   if (!claim.rowCount) return false;
+  if (claim.rows[0].recovery_mode === "DIRECT" && Number(claim.rows[0].found_owner_id) === userId) return true;
   if (actor.role === "ADMIN" || (actor.role === "STAFF" && claim.rows[0].authority_id == null)) return true;
   const access = await client.query(
     `SELECT am.membership_id

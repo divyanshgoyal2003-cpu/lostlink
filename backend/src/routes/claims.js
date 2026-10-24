@@ -5,7 +5,7 @@ const authenticateToken = require("../middleware/auth");
 const crypto = require("node:crypto");
 const { MATCH_SCORE_THRESHOLD } = require("../config/matching");
 const { createNotification } = require("../notifications");
-const { isCurrentReviewer, isCurrentAdmin, canReviewClaim } = require("../authorityAccess");
+const { currentUser, isCurrentReviewer, isCurrentAdmin, canReviewClaim, hasActiveAuthorityMembership } = require("../authorityAccess");
 
 const router = express.Router();
 
@@ -40,6 +40,9 @@ router.get("/", authenticateToken, async (req, res) => {
                   WHERE ctr.report_id=found.report_id AND ctr.custody_status='RECEIVED') AS authority_custody_received,
           found.status AS found_report_status,
           conv.conversation_status,
+          latest.verification_status AS latest_verification_status,
+          handover.handover_status,
+          handover.code_expires_at AS handover_code_expires_at,
           CASE
             WHEN c.claimant_user_id = $1 THEN 'CLAIMANT'
             ELSE 'FOUND_REPORT_OWNER'
@@ -53,6 +56,12 @@ router.get("/", authenticateToken, async (req, res) => {
           ON found.report_id = m.found_report_id
         LEFT JOIN authority_destinations found_authority ON found_authority.authority_id = found.authority_id
         LEFT JOIN conversations conv ON conv.claim_id = c.claim_id
+        LEFT JOIN LATERAL (
+          SELECT verification_status FROM claim_verifications
+          WHERE claim_id = c.claim_id
+          ORDER BY created_at DESC, verification_id DESC LIMIT 1
+        ) latest ON TRUE
+        LEFT JOIN handover_records handover ON handover.claim_id = c.claim_id
         WHERE c.claimant_user_id = $1
            OR (found.user_id = $1 AND found.recovery_mode = 'DIRECT')
         ORDER BY c.submitted_at DESC, c.claim_id DESC
@@ -206,7 +215,6 @@ router.post("/", authenticateToken, async (req, res) => {
       [matchId, userId]
     );
 
-    await client.query("INSERT INTO conversations (claim_id, conversation_status) VALUES ($1, 'OPEN')", [claimResult.rows[0].claim_id]);
     await createNotification(client, userId, "CLAIM_SUBMITTED", "CLAIM", claimResult.rows[0].claim_id);
     if (!match.found_authority_id) {
       await createNotification(
@@ -399,8 +407,79 @@ router.get("/review-queue", authenticateToken, async (req, res) => {
   }
 });
 
+// POST /api/claims/:claimId/conversation/open
+// The finder enables direct-recovery chat; an assigned authority member enables authority cases after receipt.
+router.post("/:claimId/conversation/open", authenticateToken, async (req, res) => {
+  const claimId = parseClaimId(req.params.claimId);
+  if (!claimId) return res.status(400).json({ error: "A valid claimId is required" });
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+    const claimResult = await client.query(
+      `SELECT c.claim_status, c.claimant_user_id, f.report_id AS found_report_id,
+              f.user_id AS finder_id, f.recovery_mode, f.authority_id,
+              EXISTS (SELECT 1 FROM custody_transfer_requests ctr
+                      WHERE ctr.report_id=f.report_id AND ctr.custody_status='RECEIVED') AS custody_received
+       FROM claim_requests c
+       JOIN match_records m ON m.match_id=c.match_id
+       JOIN reports f ON f.report_id=m.found_report_id
+       WHERE c.claim_id=$1 FOR UPDATE OF c, f`,
+      [claimId]
+    );
+    if (!claimResult.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Claim not found" });
+    }
+    const claim = claimResult.rows[0];
+    const actor = await client.query("SELECT account_status FROM users WHERE user_id=$1 FOR SHARE", [req.user.userId]);
+    const isFinder = claim.recovery_mode === "DIRECT" && Number(claim.finder_id) === req.user.userId;
+    const isAssignedAuthority = claim.recovery_mode === "AUTHORITY" && claim.authority_id && claim.custody_received &&
+      await hasActiveAuthorityMembership(client, req.user.userId, claim.authority_id, {
+        requireCustody: true,
+        reportId: claim.found_report_id,
+      });
+    if (actor.rows[0]?.account_status !== "ACTIVE" || (!isFinder && !isAssignedAuthority)) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Only the finder or the assigned authority after receipt can enable this chat" });
+    }
+    if (!["SUBMITTED", "IN_REVIEW", "APPROVED"].includes(claim.claim_status)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Chat cannot be enabled for an inactive claim" });
+    }
+    const existing = await client.query(
+      "SELECT conversation_status FROM conversations WHERE claim_id=$1 FOR UPDATE",
+      [claimId]
+    );
+    if (existing.rowCount && existing.rows[0].conversation_status !== "OPEN") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "This claim's conversation is closed" });
+    }
+    if (!existing.rowCount) {
+      await client.query(
+        "INSERT INTO conversations (claim_id, conversation_status) VALUES ($1, 'OPEN') ON CONFLICT (claim_id) DO NOTHING",
+        [claimId]
+      );
+      await client.query(
+        `INSERT INTO audit_logs (actor_user_id, action_type, entity_type, entity_id, metadata)
+         VALUES ($1, 'CLAIM_CHAT_ENABLED', 'CLAIM', $2, '{}'::jsonb)`,
+        [req.user.userId, claimId]
+      );
+      await createNotification(client, claim.claimant_user_id, "CLAIM_CHAT_ENABLED", "CLAIM", claimId);
+    }
+    await client.query("COMMIT");
+    return res.json({ claimId: String(claimId), conversationStatus: "OPEN" });
+  } catch (error) {
+    await rollback(client);
+    console.error("Enable claim conversation failed:", error.message);
+    return res.status(500).json({ error: "Unable to enable chat for this claim" });
+  } finally {
+    client?.release();
+  }
+});
+
 // GET /api/claims/:claimId/verifications
-// Private review notes are available only to staff/admin reviewers.
+// Private review notes are available only to staff, assigned authorities, and the direct found-item owner.
 router.get("/:claimId/verifications", authenticateToken, async (req, res) => {
   const claimId = parseClaimId(req.params.claimId);
   if (!claimId) {
@@ -682,7 +761,7 @@ router.patch("/:claimId/review", authenticateToken, async (req, res) => {
 });
 
 // POST /api/claims/:claimId/handover/code
-// The found-report owner issues a one-time code for an approved claim.
+// The claimant retrieves a one-time code after approval and presents it to the item holder.
 router.post("/:claimId/handover/code", authenticateToken, async (req, res) => {
   const claimId = parseClaimId(req.params.claimId);
   if (!claimId) {
@@ -694,7 +773,7 @@ router.post("/:claimId/handover/code", authenticateToken, async (req, res) => {
     client = await pool.connect();
     await client.query("BEGIN");
     const result = await client.query(
-      `SELECT c.claim_id, c.claim_status, m.found_report_id, f.user_id AS found_owner_id,
+      `SELECT c.claim_id, c.claim_status, c.claimant_user_id, m.found_report_id, f.user_id AS found_owner_id,
               f.authority_id, f.recovery_mode,
               EXISTS (SELECT 1 FROM custody_transfer_requests ctr
                       WHERE ctr.report_id = f.report_id AND ctr.custody_status = 'RECEIVED') AS custody_received
@@ -710,13 +789,14 @@ router.post("/:claimId/handover/code", authenticateToken, async (req, res) => {
       return res.status(404).json({ error: "Claim not found" });
     }
     const claim = result.rows[0];
-    const finderStillCustodian = Number(claim.found_owner_id) === req.user.userId &&
-      !(claim.recovery_mode === "AUTHORITY" && claim.custody_received);
-    const authorityCanRelease = claim.recovery_mode === "AUTHORITY" && claim.custody_received &&
-      await canReviewClaim(client, req.user.userId, claimId);
-    if (!finderStillCustodian && !authorityCanRelease) {
+    const actor = await currentUser(client, req.user.userId);
+    if (!actor || actor.account_status !== "ACTIVE") {
       await rollback(client);
-      return res.status(403).json({ error: "Only the responsible finder or assigned authority may issue a handover code" });
+      return res.status(403).json({ error: "An active account is required to retrieve a handover code" });
+    }
+    if (Number(claim.claimant_user_id) !== req.user.userId) {
+      await rollback(client);
+      return res.status(403).json({ error: "Only the claimant can retrieve the handover code" });
     }
     if (claim.claim_status !== "APPROVED") {
       await rollback(client);
@@ -766,7 +846,7 @@ router.post("/:claimId/handover/code", authenticateToken, async (req, res) => {
     );
     await client.query("COMMIT");
     return res.status(existing.rowCount ? 200 : 201).json({
-      message: "Handover code issued; share it only with the claimant",
+      message: "Handover code retrieved; show it only to the person completing the return",
       code,
       expiresInMinutes: HANDOVER_CODE_TTL_MINUTES,
     });
@@ -780,7 +860,7 @@ router.post("/:claimId/handover/code", authenticateToken, async (req, res) => {
 });
 
 // POST /api/claims/:claimId/handover/confirm
-// The claimant confirms receipt. The hash comparison and all status changes
+// The responsible finder or assigned authority confirms safe handover. The hash comparison and all status changes
 // happen under row locks in one transaction to prevent replay or race wins.
 router.post("/:claimId/handover/confirm", authenticateToken, async (req, res) => {
   const claimId = parseClaimId(req.params.claimId);
@@ -799,6 +879,9 @@ router.post("/:claimId/handover/confirm", authenticateToken, async (req, res) =>
     const result = await client.query(
       `SELECT c.claim_id, c.claim_status, c.claimant_user_id, c.match_id,
               m.lost_report_id, m.found_report_id, found.user_id AS found_report_owner_id,
+              found.authority_id, found.recovery_mode,
+              EXISTS (SELECT 1 FROM custody_transfer_requests ctr
+                      WHERE ctr.report_id = found.report_id AND ctr.custody_status = 'RECEIVED') AS custody_received,
               h.handover_id, h.handover_status, h.code_hash,
               h.code_expires_at, h.code_used_at
        FROM claim_requests c
@@ -807,7 +890,7 @@ router.post("/:claimId/handover/confirm", authenticateToken, async (req, res) =>
       LEFT JOIN conversations conv ON conv.claim_id=c.claim_id
        LEFT JOIN handover_records h ON h.claim_id = c.claim_id
        WHERE c.claim_id = $1
-       FOR UPDATE OF c, m`,
+       FOR UPDATE OF c, m, found`,
       [claimId]
     );
     if (!result.rowCount) {
@@ -815,9 +898,16 @@ router.post("/:claimId/handover/confirm", authenticateToken, async (req, res) =>
       return res.status(404).json({ error: "Claim not found" });
     }
     const claim = result.rows[0];
-    if (Number(claim.claimant_user_id) !== req.user.userId) {
+    const actor = await currentUser(client, req.user.userId);
+    const finderCanConfirm = actor?.account_status === "ACTIVE" && claim.recovery_mode === "DIRECT" && Number(claim.found_report_owner_id) === req.user.userId;
+    const authorityCanConfirm = claim.recovery_mode === "AUTHORITY" && claim.custody_received &&
+      await hasActiveAuthorityMembership(client, req.user.userId, claim.authority_id, {
+        requireCustody: true,
+        reportId: claim.found_report_id,
+      });
+    if (!finderCanConfirm && !authorityCanConfirm) {
       await rollback(client);
-      return res.status(403).json({ error: "Only the claimant can confirm handover" });
+      return res.status(403).json({ error: "Only the responsible finder or assigned authority can confirm handover" });
     }
     if (claim.claim_status !== "APPROVED" || claim.handover_status !== "CODE_ISSUED" || claim.code_used_at) {
       await rollback(client);
@@ -964,6 +1054,7 @@ router.get("/:claimId/photos", authenticateToken, async (req, res) => {
       sharingStatus: shared ? "SHARED" : "PRIVATE",
       conversationOpen: claim.conversation_status === "OPEN",
       requiredViewsComplete: requiredViews.rows[0].count === 3,
+      canManage: isFinder || canReview,
       canGrant: claim.conversation_status === "OPEN" && (isFinder || canReview) && requiredViews.rows[0].count === 3,
       canRevoke: shared && (Number(claim.granted_by_user_id) === req.user.userId || canReview),
       photos: photosResult.rows.map((row) => ({

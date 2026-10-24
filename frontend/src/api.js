@@ -60,6 +60,10 @@ export async function getMyReports(token) {
   return authenticatedRequest('/reports/mine', token)
 }
 
+export async function getMyReturnHistory(token) {
+  return authenticatedRequest('/reports/mine/history', token)
+}
+
 export async function updateReport(token, reportId, report) {
   return authenticatedRequest(`/reports/${reportId}`, token, {
     method: 'PATCH',
@@ -93,13 +97,35 @@ export async function provisionAuthorityAccount(token, details) {
   })
 }
 
-export async function getClaimConversation(token, claimId) {
-  return authenticatedRequest(`/conversations/claims/${encodeURIComponent(claimId)}`, token)
+export async function getClaimConversation(token, claimId, { beforeMessageId, limit } = {}) {
+  const query = new URLSearchParams()
+  if (beforeMessageId) query.set('beforeMessageId', beforeMessageId)
+  if (limit) query.set('limit', String(limit))
+  return authenticatedRequest(`/conversations/claims/${encodeURIComponent(claimId)}${query.size ? `?${query}` : ''}`, token)
 }
 
-export async function sendClaimConversationMessage(token, claimId, message) {
+export async function getConversationInbox(token) { return authenticatedRequest('/conversations/inbox', token) }
+export async function markConversationRead(token, claimId, lastReadMessageId) {
+  return authenticatedRequest(`/conversations/claims/${encodeURIComponent(claimId)}/read`, token, { method: 'PATCH', body: JSON.stringify({ lastReadMessageId }) })
+}
+export async function createProofRequest(token, claimId, request) {
+  return authenticatedRequest(`/conversations/claims/${encodeURIComponent(claimId)}/proof-requests`, token, { method: 'POST', body: JSON.stringify(request) })
+}
+export async function reviewProofRequest(token, requestId, status) {
+  return authenticatedRequest(`/conversations/proof-requests/${encodeURIComponent(requestId)}`, token, { method: 'PATCH', body: JSON.stringify({ status }) })
+}
+export async function uploadConversationProof(token, requestId, file, note = '') {
+  return authenticatedRequest(`/conversations/proof-requests/${encodeURIComponent(requestId)}/attachments`, token, { method: 'PUT', headers: { 'Content-Type': file.type, 'X-Proof-Note': note }, body: file })
+}
+export async function downloadConversationProof(token, attachmentId) {
+  const response = await fetch(`${API_BASE_URL}/conversations/proof-attachments/${encodeURIComponent(attachmentId)}/content`, { headers: { Authorization: `Bearer ${token}` } })
+  if (!response.ok) throw new Error('Evidence is not available to this account.')
+  return response.blob()
+}
+
+export async function sendClaimConversationMessage(token, claimId, message, clientMessageId = crypto.randomUUID()) {
   return authenticatedRequest(`/conversations/claims/${encodeURIComponent(claimId)}`, token, {
-    method: 'POST', body: JSON.stringify({ message }),
+    method: 'POST', body: JSON.stringify({ message, clientMessageId }),
   })
 }
 export async function getAuthorityMemberships(token) {
@@ -122,8 +148,9 @@ export async function reviewAuthorityMembership(token, membershipId, action, mem
   })
 }
 
-export async function getAuthorityCases(token) {
-  return authenticatedRequest('/authorities/cases', token)
+export async function getAuthorityCases(token, { history = false } = {}) {
+  const query = history ? '?history=true' : ''
+  return authenticatedRequest(`/authorities/cases${query}`, token)
 }
 
 export async function assignReportAuthority(token, reportId, recoveryMode, authorityId = null) {
@@ -137,9 +164,11 @@ export async function initiateCustodyTransfer(token, reportId) {
 }
 
 export async function confirmCustodyTransfer(token, transferId, code) {
-  return authenticatedRequest(`/authorities/custody-transfers/${encodeURIComponent(transferId)}/confirm`, token, {
+  const result = await authenticatedRequest(`/authorities/custody-transfers/${encodeURIComponent(transferId)}/confirm`, token, {
     method: 'POST', body: JSON.stringify({ code }),
   })
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event('lostlink:return-history-refresh'))
+  return result
 }
 
 export async function cancelCustodyTransfer(token, transferId) {
@@ -200,8 +229,18 @@ export async function markAllNotificationsRead(token) {
   return result
 }
 
+export async function clearAllNotifications(token) {
+  const result = await authenticatedRequest('/notifications', token, { method: 'DELETE' })
+  notifyNotificationsChanged()
+  return result
+}
+
 export async function getClaimReviewQueue(token) {
   return authenticatedRequest('/claims/review-queue', token)
+}
+
+export async function enableClaimConversation(token, claimId) {
+  return authenticatedRequest(`/claims/${encodeURIComponent(claimId)}/conversation/open`, token, { method: 'POST' })
 }
 
 export async function getClaimVerifications(token, claimId) {
@@ -238,6 +277,7 @@ export async function confirmHandover(token, claimId, code) {
     body: JSON.stringify({ code }),
   })
   notifyNotificationsChanged()
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event('lostlink:return-history-refresh'))
   return result
 }
 

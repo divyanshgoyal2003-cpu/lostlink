@@ -1,0 +1,8 @@
+.conversation-inbox{margin:1rem 0;padding:1rem;border:1px solid #d8e5df;border-radius:12px;background:#f7fbf8}
+.conversation-inbox h3{margin:0 0 .75rem}
+.conversation-inbox-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,16rem),1fr));gap:.65rem}
+.conversation-inbox-item{display:grid;gap:.3rem;text-align:left;padding:.8rem;border:1px solid #d8e5df;border-radius:10px;background:#fff;color:inherit;cursor:pointer;min-width:0}
+.conversation-inbox-item:hover,.conversation-inbox-item:focus-visible{border-color:#16845e;outline-color:#16845e}
+.conversation-inbox-item span,.conversation-inbox-item small{color:#65736d;overflow-wrap:anywhere}
+.conversation-inbox-item b{justify-self:start;color:#08744f;font-size:.8rem}
+@media(max-width:600px){.conversation-inbox{padding:.75rem}.conversation-inbox-list{grid-template-columns:1fr}}

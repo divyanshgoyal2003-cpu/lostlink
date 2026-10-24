@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import {
   confirmCustodyTransfer,
+  confirmHandover,
   getAuthorityAdminQueue,
   getAuthorityCapabilities,
   getAuthorityCases,
@@ -16,8 +17,8 @@ import {
   getPrivatePhoto,
 } from '../api'
 import './AuthorityPortal.css'
-import ConversationPanel from './ConversationPanel'
 import ClaimPhotoAccess from './ClaimPhotoAccess'
+import ConversationInbox from './ConversationInbox'
 
 function AuthorityReportPhotos({ token, reportId, photos = [] }) {
   const [images, setImages] = useState([])
@@ -65,6 +66,7 @@ function AuthorityPortal({ token, user, onLogin }) {
   const [capabilities, setCapabilities] = useState({ custodyTransfersEnabled: false })
   const [form, setForm] = useState({ authorityId: '', authorityName: '', institutionType: '', officialEmail: '', contactInformation: '', locationDescription: '', name: '', email: '', password: '' })
   const [codes, setCodes] = useState({})
+  const [handoverCodes, setHandoverCodes] = useState({})
   const [issued, setIssued] = useState(null)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState('')
@@ -169,6 +171,22 @@ function AuthorityPortal({ token, user, onLogin }) {
     }
   }
 
+  async function confirmClaimReturn(claimId) {
+    setSaving(`claim-return:${claimId}`)
+    setError('')
+    setMessage('')
+    try {
+      await confirmHandover(token, claimId, handoverCodes[claimId] || '')
+      setHandoverCodes((previous) => ({ ...previous, [claimId]: '' }))
+      setMessage('Safe return confirmed. The claim and related reports are now marked returned.')
+      await load()
+    } catch (confirmError) {
+      setError(confirmError.message || 'Could not confirm safe return.')
+    } finally {
+      setSaving('')
+    }
+  }
+
   async function updateAssignment(reportId) {
     const choice = assignments[reportId] || {}
     setSaving(`assignment:${reportId}`)
@@ -233,8 +251,9 @@ function AuthorityPortal({ token, user, onLogin }) {
 
   return (
     <section className="authority-section" id="authority-portal">
-      <div className="section-heading"><span className="section-kicker">{isAdmin ? 'ADMINISTRATION' : showAuthorityCases ? 'AUTHORITY PORTAL' : 'RETURN PLAN'}</span><h2>{isAdmin ? 'LostLink admin dashboard' : showAuthorityCases ? 'Authority case dashboard' : 'My return plan'}</h2><p>{isAdmin ? 'Manage authority access, review new institutions, and open the claim review workspace.' : showAuthorityCases ? 'Assigned cases, claim review, and claimant conversations for your authority.' : 'Choose whether to coordinate a return directly or hand a found item to a verified authority.'}</p></div>
+      <div className="section-heading"><span className="section-kicker">{isAdmin ? 'ADMINISTRATION' : showAuthorityCases ? 'AUTHORITY PORTAL' : 'RETURN PLAN'}</span><h2>{isAdmin ? 'LostLink admin dashboard' : showAuthorityCases ? 'Authority case dashboard' : 'My return plan'}</h2><p>{isAdmin ? 'Manage authority access, review new institutions, and open the claim review workspace.' : showAuthorityCases ? 'Assigned cases and safe-return handovers for your authority.' : 'Choose whether to coordinate a return directly or hand a found item to a verified authority.'}</p></div>
       {error && <p className="authority-alert error" role="alert">{error}</p>}
+      {showAuthorityCases && <ConversationInbox token={token} />}
       {message && <p className="authority-alert success" role="status">{message}</p>}
       {provisionedCredentials && <div className="authority-credentials" role="status"><div><h3>New authority login credentials</h3><p>Shown only in this session. Send these details through your secure channel, then hide them.</p><dl><dt>Login email</dt><dd>{provisionedCredentials.email}</dd><dt>Initial password</dt><dd><code>{provisionedCredentials.password}</code></dd></dl></div><button type="button" className="btn btn-secondary" onClick={() => setProvisionedCredentials(null)}>Hide credentials</button></div>}
       {loading ? <div className="authority-panel" role="status">Loading authority data…</div> : (
@@ -322,7 +341,15 @@ function AuthorityPortal({ token, user, onLogin }) {
                   <button className="btn btn-primary" disabled={Boolean(saving)}>{saving === `transfer:${item.custody_transfer_id}` ? 'Confirming…' : 'Confirm physical receipt'}</button>
                 </form>}
                 {item.custody_status === 'RECEIVED' && <p className="authority-received">In custody since {new Date(item.received_at).toLocaleString()}</p>}
-                {item.claims?.map((claim) => <div className="authority-claim-thread" key={claim.claim_id}><h5>Claimant conversation · {claim.claim_status.replaceAll('_', ' ')}</h5><ClaimPhotoAccess token={token} claimId={claim.claim_id} />{claim.conversation_status === 'OPEN' && <ConversationPanel token={token} claimId={claim.claim_id} title={`Chat with ${claim.claimant_name}`} />}</div>)}
+                {item.claims?.map((claim) => <div className="authority-claim-thread" key={claim.claim_id}>
+                  <ClaimPhotoAccess token={token} claimId={claim.claim_id} />
+                  {claim.claim_status === 'APPROVED' && claim.handover_status !== 'COMPLETED' && <form className="custody-confirm-form" onSubmit={(event) => { event.preventDefault(); confirmClaimReturn(claim.claim_id) }}>
+                    <label htmlFor={`claim-return-code-${claim.claim_id}`}>Claimant’s safe-return code</label>
+                    <input id={`claim-return-code-${claim.claim_id}`} inputMode="numeric" autoComplete="one-time-code" maxLength={8} pattern="[0-9]{8}" value={handoverCodes[claim.claim_id] || ''} onChange={(event) => setHandoverCodes((previous) => ({ ...previous, [claim.claim_id]: event.target.value.replace(/\D/g, '').slice(0, 8) }))} required />
+                    <button className="btn btn-primary" disabled={Boolean(saving) || (handoverCodes[claim.claim_id] || '').length !== 8}>{saving === `claim-return:${claim.claim_id}` ? 'Confirming…' : 'Confirm safe return'}</button>
+                  </form>}
+                  {claim.handover_status === 'COMPLETED' && <p className="authority-received">Safe return confirmed.</p>}
+                </div>)}
               </article>
             ))}</div>}
             {!capabilities.custodyTransfersEnabled && <p className="authority-note">Custody transfers are disabled until the server is configured with a secret HMAC key of at least 32 bytes.</p>}

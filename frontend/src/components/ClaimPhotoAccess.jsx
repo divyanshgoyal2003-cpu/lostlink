@@ -12,6 +12,7 @@ function ClaimPhotoAccess({ token, claimId, onRefresh }) {
   async function loadAccess() {
     setLoading(true)
     setError('')
+    setPhotoUrls([])
     try {
       const result = await getClaimPhotoAccess(token, claimId)
       setAccess(result)
@@ -74,11 +75,14 @@ function ClaimPhotoAccess({ token, claimId, onRefresh }) {
     <section className="claim-photo-access" aria-label={`Photo sharing for claim ${claimId}`}>
       <div className="claim-photo-access-heading">
         <strong>Found-item photos: {access?.sharingStatus === 'SHARED' ? 'Shared for this claim' : 'Private'}</strong>
-        {!access?.conversationOpen && <small>Sharing becomes available when this claim has an open conversation.</small>}
-        {access?.conversationOpen && access?.canGrant !== true && access?.sharingStatus !== 'SHARED' && !access?.requiredViewsComplete && (
-          <small>Complete the Front, Back, and Side capture before sharing.</small>
-        )}
+        {access?.sharingStatus === 'SHARED' && <small>The claimant on this claim can view these photos securely.</small>}
+        {access?.canManage && access?.sharingStatus !== 'SHARED' && !access?.conversationOpen && <small>Enable chat for this claim before sharing photos.</small>}
+        {access?.canManage && access?.sharingStatus !== 'SHARED' && access?.conversationOpen && !access?.requiredViewsComplete && <small>Complete the Front, Back, and Side capture before sharing.</small>}
+        {!access?.canManage && access?.sharingStatus !== 'SHARED' && <small>The finder or assigned authority must explicitly share photos for this claim.</small>}
       </div>
+      <button type="button" className="btn btn-secondary" disabled={loading || pending} onClick={loadAccess}>
+        {loading ? 'Refreshing…' : 'Refresh photo access'}
+      </button>
       {access?.photos?.length > 0 && photoUrls.length > 0 && (
         <div className="claim-photo-gallery">
           {photoUrls.map((photo) => (
@@ -89,8 +93,8 @@ function ClaimPhotoAccess({ token, claimId, onRefresh }) {
           ))}
         </div>
       )}
-      {access?.canGrant && access?.sharingStatus !== 'SHARED' && access?.photos?.length > 0 && (
-        <button type="button" className="btn btn-primary" disabled={pending} onClick={handleGrant}>
+      {access?.canManage && access?.sharingStatus !== 'SHARED' && (
+        <button type="button" className="btn btn-primary" disabled={pending || !access?.canGrant} onClick={handleGrant}>
           {pending ? 'Updating…' : 'Share photos with claimant'}
         </button>
       )}

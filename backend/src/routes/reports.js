@@ -664,10 +664,27 @@ if (
   }
 });
 
-/**
- * GET /api/reports/mine
- * Retrieve reports owned by the authenticated user.
- */
+/** GET /api/reports/mine/history - returned found reports owned by the user. */
+router.get("/mine/history", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT r.report_id, r.report_type, r.report_time, r.status, r.updated_at,
+              i.category, i.title, r.recovery_mode, ad.name AS authority_name
+       FROM reports r
+       JOIN items i ON i.item_id = r.item_id
+       LEFT JOIN authority_destinations ad ON ad.authority_id = r.authority_id
+       WHERE r.user_id = $1 AND r.report_type = 'FOUND' AND r.status = 'RETURNED'
+       ORDER BY r.updated_at DESC, r.report_id DESC`,
+      [req.user.userId]
+    );
+    return res.json({ count: result.rowCount, reports: result.rows });
+  } catch (error) {
+    console.error("Get returned report history failed:", error.message);
+    return res.status(500).json({ error: "Unable to retrieve return history" });
+  }
+});
+
+/** GET /api/reports/mine - active reports owned by the authenticated user. */
 router.get("/mine", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -703,6 +720,7 @@ router.get("/mine", authenticateToken, async (req, res) => {
          ORDER BY initiated_at DESC, custody_transfer_id DESC LIMIT 1
        ) latest_custody ON TRUE
        WHERE r.user_id = $1
+         AND r.status <> 'RETURNED'
          AND NOT (r.report_type = 'FOUND' AND EXISTS (
            SELECT 1 FROM custody_transfer_requests received
            WHERE received.report_id = r.report_id AND received.custody_status = 'RECEIVED'

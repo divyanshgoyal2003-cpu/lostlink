@@ -6,6 +6,7 @@ dist/
 coverage/
 uploads/
 /backend/private-photos/
+/backend/private-proof-files/
 .DS_Store
 Thumbs.db
 # Logs

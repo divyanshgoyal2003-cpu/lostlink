@@ -12,11 +12,15 @@ function authorizedTargetSql(userParameter = "$1") {
       JOIN reports lost ON lost.report_id = m.lost_report_id
       WHERE m.match_id = n.reference_id AND lost.user_id = ${userParameter}
     ) THEN '#my-matches'
-    WHEN n.reference_type = 'CLAIM' AND EXISTS (
+    WHEN n.reference_type IN ('CLAIM', 'MESSAGE', 'PROOF_REQUEST') AND EXISTS (
       SELECT 1 FROM claim_requests c
       JOIN match_records m ON m.match_id = c.match_id
       JOIN reports found ON found.report_id = m.found_report_id
-      WHERE c.claim_id = n.reference_id
+      WHERE c.claim_id = CASE n.reference_type
+        WHEN 'CLAIM' THEN n.reference_id
+        WHEN 'MESSAGE' THEN (SELECT v.claim_id FROM messages msg JOIN conversations v USING(conversation_id) WHERE msg.message_id=n.reference_id)
+        ELSE (SELECT v.claim_id FROM conversation_proof_requests pr JOIN conversations v USING(conversation_id) WHERE pr.proof_request_id=n.reference_id)
+      END
         AND (
           c.claimant_user_id = ${userParameter}
           OR found.user_id = ${userParameter}
@@ -31,7 +35,13 @@ function authorizedTargetSql(userParameter = "$1") {
               AND ctr.custody_status='RECEIVED'
           )
         )
-    ) THEN '#my-claims'
+    ) THEN CASE WHEN EXISTS (
+      SELECT 1 FROM users u WHERE u.user_id=${userParameter} AND u.role IN ('STAFF','ADMIN')
+    ) OR EXISTS (
+      SELECT 1 FROM authority_memberships am JOIN authority_destinations ad USING(authority_id)
+      WHERE am.user_id=${userParameter} AND am.membership_status='ACTIVE'
+        AND ad.verification_status='VERIFIED' AND ad.destination_status='ACTIVE'
+    ) THEN '#authority-portal' ELSE '#my-claims' END
     WHEN n.reference_type = 'REPORT' AND EXISTS (
       SELECT 1 FROM reports r WHERE r.report_id=n.reference_id AND r.user_id=${userParameter}
     ) THEN '#my-reports'
@@ -117,6 +127,19 @@ router.post("/read-all", async (req, res) => {
   } catch (error) {
     console.error("Mark all notifications read failed:", error.message)
     return res.status(500).json({ error: "Unable to update notifications" })
+  }
+})
+
+router.delete("/", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "DELETE FROM notifications WHERE user_id = $1",
+      [req.user.userId]
+    )
+    return res.json({ deletedCount: result.rowCount })
+  } catch (error) {
+    console.error("Clear notifications failed:", error.message)
+    return res.status(500).json({ error: "Unable to clear notifications" })
   }
 })
 

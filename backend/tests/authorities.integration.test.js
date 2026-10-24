@@ -254,6 +254,30 @@ test("authority custody is separate, HMAC protected, private, and confirms once 
   assert.equal(receivedCase.model, "Test Model");
   const confirmationEvents = await pool.query("SELECT COUNT(*)::int AS count FROM audit_logs WHERE action_type='CUSTODY_TRANSFER_CONFIRMED' AND entity_id=$1", [transferId]);
   assert.equal(confirmationEvents.rows[0].count, 1);
+  const claimant = await register("Sprint 12 Authority Chat Claimant");
+  const lostItem = await pool.query(
+    `INSERT INTO items(category,title,description,color,attributes_json)
+     VALUES('ELECTRONICS','Authority chat lost item','Chat integration fixture','Black','{}') RETURNING item_id`
+  );
+  itemIds.push(Number(lostItem.rows[0].item_id));
+  const lostReport = await pool.query(
+    `INSERT INTO reports(user_id,item_id,report_type,report_time,location_point,uncertainty_radius_m,location_source)
+     VALUES($1,$2,'LOST',NOW(),ST_SetSRID(ST_MakePoint(145,-65),4326)::geography,50,'MAP_PIN') RETURNING report_id`,
+    [claimant.id,itemIds.at(-1)]
+  );
+  reportIds.push(Number(lostReport.rows[0].report_id));
+  const chatMatch = await pool.query(
+    `INSERT INTO match_records(lost_report_id,found_report_id,location_score,item_score,time_score,description_score,total_score)
+     VALUES($1,$2,90,90,90,90,90) RETURNING match_id`, [lostReport.rows[0].report_id,reportId]
+  );
+  matchIds.push(Number(chatMatch.rows[0].match_id));
+  const chatClaim = await pool.query("INSERT INTO claim_requests(match_id,claimant_user_id) VALUES($1,$2) RETURNING claim_id", [chatMatch.rows[0].match_id,claimant.id]);
+  claimIds.push(Number(chatClaim.rows[0].claim_id));
+  await pool.query("INSERT INTO conversations(claim_id,conversation_status) VALUES($1,'OPEN')", [chatClaim.rows[0].claim_id]);
+  assert.equal((await api(`/api/conversations/claims/${chatClaim.rows[0].claim_id}`, { token: claimant.token })).status, 200);
+  assert.equal((await api(`/api/conversations/claims/${chatClaim.rows[0].claim_id}`, { token: assigned.member.token })).status, 200);
+  assert.equal((await api(`/api/conversations/claims/${chatClaim.rows[0].claim_id}`, { token: owner.token })).status, 403);
+  assert.equal((await api(`/api/conversations/claims/${chatClaim.rows[0].claim_id}`, { token: unrelated.token })).status, 403);
 });
 
 test("invalid custody attempts lock the code and expired requests can be replaced", async () => {
@@ -347,6 +371,24 @@ test("authority members review claims only after custody and final release uses 
   claimIds.push(claimId);
   const queue = await api("/api/claims/review-queue", { token: assigned.member.token });
   assert.ok((await queue.json()).claims.some((item) => Number(item.claim_id) === claimId));
+  await pool.query("DELETE FROM conversations WHERE claim_id=$1", [claimId]);
+  const finderCannotEnableAuthorityChat = await api(`/api/claims/${claimId}/conversation/open`, {
+    method: "POST", token: owner.token,
+  });
+  assert.equal(finderCannotEnableAuthorityChat.status, 403);
+  const claimantCannotEnableAuthorityChat = await api(`/api/claims/${claimId}/conversation/open`, {
+    method: "POST", token: lostUser.token,
+  });
+  assert.equal(claimantCannotEnableAuthorityChat.status, 403);
+  const unrelatedCannotEnableAuthorityChat = await api(`/api/claims/${claimId}/conversation/open`, {
+    method: "POST", token: unrelated.token,
+  });
+  assert.equal(unrelatedCannotEnableAuthorityChat.status, 403);
+  const authorityEnabledChat = await api(`/api/claims/${claimId}/conversation/open`, {
+    method: "POST", token: assigned.member.token,
+  });
+  assert.equal(authorityEnabledChat.status, 200, await authorityEnabledChat.clone().text());
+  assert.equal((await authorityEnabledChat.json()).conversationStatus, "OPEN");
   const verification = await api(`/api/claims/${claimId}/verifications`, {
     method: "POST", token: assigned.member.token,
     body: JSON.stringify({ verificationType: "AUTHORITY_REVIEW", status: "PASSED", privateNote: "authority test note" }),
@@ -354,12 +396,29 @@ test("authority members review claims only after custody and final release uses 
   assert.equal(verification.status, 201, await verification.clone().text());
   const review = await api(`/api/claims/${claimId}/review`, { method: "PATCH", token: assigned.member.token, body: JSON.stringify({ decision: "APPROVED" }) });
   assert.equal(review.status, 200, await review.clone().text());
-  const codeResponse = await api(`/api/claims/${claimId}/handover/code`, { method: "POST", token: assigned.member.token });
+  const codeResponse = await api(`/api/claims/${claimId}/handover/code`, { method: "POST", token: lostUser.token });
   assert.equal(codeResponse.status, 201, await codeResponse.clone().text());
   const releaseCode = (await codeResponse.json()).code;
-  const release = await api(`/api/claims/${claimId}/handover/confirm`, { method: "POST", token: lostUser.token, body: JSON.stringify({ code: releaseCode }) });
+  const release = await api(`/api/claims/${claimId}/handover/confirm`, { method: "POST", token: assigned.member.token, body: JSON.stringify({ code: releaseCode }) });
   assert.equal(release.status, 200, await release.clone().text());
   assert.equal((await pool.query("SELECT claim_status FROM claim_requests WHERE claim_id=$1", [claimId])).rows[0].claim_status, "COMPLETED");
+
+  const activeCases = await api("/api/authorities/cases", { token: assigned.member.token });
+  assert.equal((await activeCases.json()).cases.some((item) => Number(item.report_id) === foundReportId), false);
+  const caseHistory = await api("/api/authorities/cases?history=true", { token: assigned.member.token });
+  const returnedCase = (await caseHistory.json()).cases.find((item) => Number(item.report_id) === foundReportId);
+  assert.ok(returnedCase);
+  assert.equal(returnedCase.report_status, "RETURNED");
+  assert.equal(returnedCase.claims.some((item) => Number(item.claim_id) === claimId && item.claim_status === "COMPLETED"), true);
+  assert.equal(returnedCase.description, null);
+  assert.equal(returnedCase.company, null);
+  assert.deepEqual(returnedCase.photos, []);
+  assert.equal(returnedCase.claims.find((item) => Number(item.claim_id) === claimId).claimant_name, null);
+
+  const finderActiveReports = await api("/api/reports/mine", { token: owner.token });
+  assert.equal((await finderActiveReports.json()).reports.some((item) => Number(item.report_id) === foundReportId), false);
+  const finderHistory = await api("/api/reports/mine/history", { token: owner.token });
+  assert.equal((await finderHistory.json()).reports.some((item) => Number(item.report_id) === foundReportId), true);
 });
 
 test("assigned authority can read claim photo state after custody while photos remain private by default", async () => {
@@ -403,6 +462,31 @@ test("assigned authority can read claim photo state after custody while photos r
   assert.equal(access.status, 200, JSON.stringify(body));
   assert.equal(body.sharingStatus, "PRIVATE");
   assert.deepEqual(body.photos, []);
+  assert.equal(body.canManage, true);
+
+  const foundItem = await pool.query("SELECT item_id FROM reports WHERE report_id=$1", [foundReportId]);
+  for (const photoType of ["FRONT", "BACK", "SIDE"]) {
+    await pool.query(
+      "INSERT INTO item_photos (item_id, storage_key, photo_type) VALUES ($1, $2, $3)",
+      [foundItem.rows[0].item_id, `authority-test-${claimId}-${photoType}.png`, photoType]
+    );
+  }
+  await pool.query(
+    "INSERT INTO conversations (claim_id, conversation_status) VALUES ($1, 'OPEN') ON CONFLICT (claim_id) DO UPDATE SET conversation_status='OPEN'",
+    [claimId]
+  );
+  const ready = await api(`/api/claims/${claimId}/photos`, { token: assigned.member.token });
+  const readyBody = await ready.json();
+  assert.equal(readyBody.sharingStatus, "PRIVATE");
+  assert.equal(readyBody.canGrant, true);
+  assert.deepEqual(readyBody.photos, [], "private photo metadata must remain hidden before the grant");
+
+  const grant = await api(`/api/claims/${claimId}/photo-sharing`, { method: "POST", token: assigned.member.token });
+  assert.equal(grant.status, 201, await grant.clone().text());
+  const claimantAccess = await api(`/api/claims/${claimId}/photos`, { token: lostUser.token });
+  const claimantBody = await claimantAccess.json();
+  assert.equal(claimantBody.sharingStatus, "SHARED");
+  assert.equal(claimantBody.photos.length, 3);
 });
 
 test("authority actions use current database role, and custody fails closed without configured key", async () => {

@@ -19,6 +19,7 @@ import ClaimWorkflow from './components/ClaimWorkflow'
 import FoundPhotoCapture from './components/FoundPhotoCapture'
 import NotificationCenter from './components/NotificationCenter'
 import AuthorityPortal from './components/AuthorityPortal'
+import ReturnHistory from './components/ReturnHistory'
 import { filterAndSortMatches } from './matchFilters'
 import { getMatchClaimState } from './claimCardState'
 
@@ -438,6 +439,17 @@ useEffect(() => {
   }
 }, [authToken])
 
+useEffect(() => {
+  if (!authToken) return undefined
+  const refreshReports = () => {
+    getMyReports(authToken)
+      .then((result) => setMyReports(result.reports || []))
+      .catch((error) => setReportsError(error.message || 'Could not refresh your reports.'))
+  }
+  window.addEventListener('lostlink:return-history-refresh', refreshReports)
+  return () => window.removeEventListener('lostlink:return-history-refresh', refreshReports)
+}, [authToken])
+
 const filteredMatches = filterAndSortMatches(myMatches, appliedMatchFilters)
 const eligibleLostReports = myReports.filter((report) =>
   report.report_type === 'LOST' && report.status === 'OPEN'
@@ -464,10 +476,12 @@ function updateMatchFilter(event) {
             <>
               <a href="#authority-portal">{currentUser?.role === 'ADMIN' ? 'Admin dashboard' : 'Authority dashboard'}</a>
               <a href="#claim-review">Review claims</a>
+              <a href="#return-history">Return history</a>
             </>
           ) : <>
           <a href="#how-it-works">How it works</a>
           <a href="#my-matches">My Matches</a>
+          {currentUser && <a href="#return-history">Return history</a>}
           {currentUser && (hasAuthorityDashboard || hasFoundReports) && <a href="#authority-portal">{currentUser.role === 'ADMIN' ? 'Admin dashboard' : hasAuthorityDashboard ? 'Authority dashboard' : 'My return plan'}</a>}
           <a href="#safety">Safety</a>
           </>}
@@ -1084,6 +1098,7 @@ function updateMatchFilter(event) {
   )}
 </section>
 {currentUser && (hasAuthorityDashboard || hasFoundReports) && <AuthorityPortal token={authToken} user={currentUser} onLogin={() => openAuth('login')} />}
+{currentUser && <ReturnHistory token={authToken} />}
 <section className="my-reports-section" id="my-matches">
   <div className="section-heading">
     <span className="section-kicker">MATCHING</span>

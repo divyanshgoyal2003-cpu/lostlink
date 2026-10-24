@@ -25,6 +25,38 @@ function MapUpdater({ position }) {
   return null
 }
 
+function MapSizeObserver() {
+  const map = useMap()
+
+  useEffect(() => {
+    const container = map.getContainer()
+    let animationFrame = 0
+    const invalidateVisibleMap = () => {
+      if (!container.clientWidth || !container.clientHeight) return
+      window.cancelAnimationFrame(animationFrame)
+      animationFrame = window.requestAnimationFrame(() => {
+        map.invalidateSize({ pan: false, debounceMoveend: true })
+      })
+    }
+    const observer = typeof ResizeObserver === 'undefined'
+      ? null
+      : new ResizeObserver(invalidateVisibleMap)
+
+    observer?.observe(container)
+    window.addEventListener('resize', invalidateVisibleMap)
+    const initialCheck = window.setTimeout(invalidateVisibleMap, 100)
+
+    return () => {
+      window.clearTimeout(initialCheck)
+      window.cancelAnimationFrame(animationFrame)
+      observer?.disconnect()
+      window.removeEventListener('resize', invalidateVisibleMap)
+    }
+  }, [map])
+
+  return null
+}
+
 function MapClickHandler({ onLocationSelect }) {
   useMapEvents({
     click(event) {
@@ -49,6 +81,9 @@ export default function LocationPicker({
   const [searchResults, setSearchResults] = useState([])
   const [searchLoading, setSearchLoading] = useState(false)
   const [searchError, setSearchError] = useState('')
+  const [tileSource, setTileSource] = useState('openstreetmap')
+  const [tileError, setTileError] = useState('')
+  const [tileRetry, setTileRetry] = useState(0)
 
   const hasLocation =
     latitude !== '' &&
@@ -131,6 +166,16 @@ export default function LocationPicker({
     setSearchError('')
   }
 
+  function handleTileError() {
+    if (tileSource === 'openstreetmap') {
+      setTileSource('carto')
+      setTileError('OpenStreetMap tiles did not load. Switching to backup map tiles…')
+      return
+    }
+
+    setTileError('Map tiles could not be loaded from either provider. You can still search for a location or enter coordinates manually.')
+  }
+
   return (
     <div className="location-picker">
       
@@ -206,10 +251,18 @@ export default function LocationPicker({
         className="location-picker-map"
       >
         <TileLayer
-          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          key={`${tileSource}-${tileRetry}`}
+          attribution={tileSource === 'carto'
+            ? '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
+            : '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'}
+          url={tileSource === 'carto'
+            ? 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png'
+            : 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png'}
+          maxZoom={20}
+          eventHandlers={{ tileerror: handleTileError }}
         />
 
+        <MapSizeObserver />
         <MapClickHandler onLocationSelect={onLocationChange} />
 
         {position && (
@@ -229,6 +282,17 @@ export default function LocationPicker({
 
         <MapUpdater position={position} />
       </MapContainer>
+
+      {tileError && <p className="location-map-message" role="status">
+        <span>{tileError}</span>
+        {tileSource === 'carto' && !tileError.includes('Switching') && (
+          <button type="button" className="btn btn-secondary" onClick={() => {
+            setTileError('')
+            setTileSource('openstreetmap')
+            setTileRetry((previous) => previous + 1)
+          }}>Retry map tiles</button>
+        )}
+      </p>}
 
       <div className="location-picker-details">
         <p>

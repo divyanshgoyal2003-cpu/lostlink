@@ -48,6 +48,13 @@
   font-size: 1.05rem;
 }
 
+.notification-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.35rem;
+}
+
 .notification-list {
   display: grid;
   gap: 0.55rem;

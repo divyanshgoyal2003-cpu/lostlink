@@ -451,6 +451,8 @@ test("POST /api/claims creates a claim for an eligible match", async () => {
   assert.equal(body.claim.claim_status, "SUBMITTED");
 
   claimIds.push(body.claim.claim_id);
+  const conversation = await pool.query("SELECT conversation_status FROM conversations WHERE claim_id=$1", [body.claim.claim_id]);
+  assert.equal(conversation.rowCount, 0, "Chat must remain disabled until the finder or assigned authority enables it");
   const events = await pool.query(
     `SELECT user_id, notification_type FROM notifications
      WHERE reference_type = 'CLAIM' AND reference_id = $1
@@ -879,6 +881,52 @@ test("review queue and verification endpoints require authentication and reviewe
   assert.equal(userVerification.status, 403);
 });
 
+test("only the finder can activate direct-recovery chat for an active claim", async () => {
+  const claim = await submitClaim(await createClaimableMatch());
+  await pool.query("DELETE FROM conversations WHERE claim_id=$1", [claim.claim_id]);
+
+  const claimantAttempt = await api(`/api/claims/${claim.claim_id}/conversation/open`, {
+    method: "POST",
+    token,
+  });
+  assert.equal(claimantAttempt.status, 403);
+
+  const staffAttempt = await api(`/api/claims/${claim.claim_id}/conversation/open`, {
+    method: "POST",
+    token: staffToken,
+  });
+  assert.equal(staffAttempt.status, 403);
+
+  const opened = await api(`/api/claims/${claim.claim_id}/conversation/open`, {
+    method: "POST",
+    token: foundOwnerToken,
+  });
+  assert.equal(opened.status, 200);
+  assert.equal((await opened.json()).conversationStatus, "OPEN");
+
+  const repeatedOpen = await api(`/api/claims/${claim.claim_id}/conversation/open`, {
+    method: "POST",
+    token: foundOwnerToken,
+  });
+  assert.equal(repeatedOpen.status, 200);
+  const state = await pool.query(
+    `SELECT conv.conversation_status,
+            (SELECT COUNT(*)::int FROM audit_logs WHERE entity_type='CLAIM' AND entity_id=$1 AND action_type='CLAIM_CHAT_ENABLED') AS audit_count
+     FROM conversations conv WHERE conv.claim_id=$1`,
+    [claim.claim_id]
+  );
+  assert.equal(state.rows[0].conversation_status, "OPEN");
+  assert.equal(state.rows[0].audit_count, 1);
+
+  await pool.query("UPDATE claim_requests SET claim_status='REJECTED' WHERE claim_id=$1", [claim.claim_id]);
+  await pool.query("DELETE FROM conversations WHERE claim_id=$1", [claim.claim_id]);
+  const rejectedAttempt = await api(`/api/claims/${claim.claim_id}/conversation/open`, {
+    method: "POST",
+    token: foundOwnerToken,
+  });
+  assert.equal(rejectedAttempt.status, 409);
+});
+
 test("verification starts review and private notes stay out of participant responses", async () => {
   const matchId = await createClaimableMatch();
   const claim = await submitClaim(matchId);
@@ -1033,7 +1081,7 @@ test("unknown reviewers are rejected before verification changes claim state", a
   });
 });
 
-test("only the found owner can issue a hashed handover code; claimant confirms it once", async () => {
+test("only the claimant receives a hashed handover code; found owner confirms it once", async () => {
   const matchId = await createClaimableMatch();
   const claim = await submitClaim(matchId);
   const approval = await approveClaim(claim.claim_id);
@@ -1046,15 +1094,15 @@ test("only the found owner can issue a hashed handover code; claimant confirms i
   );
   assert.equal(approvalNotification.rows[0].count, 1);
 
-  const claimantCannotIssue = await api(`/api/claims/${claim.claim_id}/handover/code`, {
+  const ownerCannotIssue = await api(`/api/claims/${claim.claim_id}/handover/code`, {
     method: "POST",
-    token,
+    token: foundOwnerToken,
   });
-  assert.equal(claimantCannotIssue.status, 403);
+  assert.equal(ownerCannotIssue.status, 403);
 
   const issued = await api(`/api/claims/${claim.claim_id}/handover/code`, {
     method: "POST",
-    token: foundOwnerToken,
+    token,
   });
   assert.equal(issued.status, 201);
   const issuedBody = await issued.json();
@@ -1071,16 +1119,16 @@ test("only the found owner can issue a hashed handover code; claimant confirms i
   assert.match(stored.rows[0].code_hash, /^[a-f0-9]{64}$/);
   assert.ok(new Date(stored.rows[0].code_expires_at).getTime() > Date.now());
 
-  const ownerCannotConfirm = await api(`/api/claims/${claim.claim_id}/handover/confirm`, {
+  const claimantCannotConfirm = await api(`/api/claims/${claim.claim_id}/handover/confirm`, {
     method: "POST",
-    token: foundOwnerToken,
+    token,
     body: JSON.stringify({ code: issuedBody.code }),
   });
-  assert.equal(ownerCannotConfirm.status, 403);
+  assert.equal(claimantCannotConfirm.status, 403);
 
   const confirmed = await api(`/api/claims/${claim.claim_id}/handover/confirm`, {
     method: "POST",
-    token,
+    token: foundOwnerToken,
     body: JSON.stringify({ code: issuedBody.code }),
   });
   assert.equal(confirmed.status, 200);
@@ -1088,7 +1136,7 @@ test("only the found owner can issue a hashed handover code; claimant confirms i
 
   const replay = await api(`/api/claims/${claim.claim_id}/handover/confirm`, {
     method: "POST",
-    token,
+    token: foundOwnerToken,
     body: JSON.stringify({ code: issuedBody.code }),
   });
   assert.equal(replay.status, 409);
@@ -1112,9 +1160,11 @@ test("only the found owner can issue a hashed handover code; claimant confirms i
     found_status: "RETURNED",
     handover_status: "COMPLETED",
     code_used_at: completed.rows[0].code_used_at,
-    verified_by_user_id: userId,
+    verified_by_user_id: foundOwnerId,
   });
   assert.ok(completed.rows[0].code_used_at);
+  const claimantClaims = await api("/api/claims", { token });
+  assert.ok((await claimantClaims.json()).claims.some((entry) => Number(entry.claim_id) === Number(claim.claim_id) && entry.claim_status === "COMPLETED"));
   const handoverEvents = await pool.query(
     `SELECT user_id, COUNT(*)::int AS count FROM notifications
      WHERE notification_type = 'HANDOVER_COMPLETED'
@@ -1128,6 +1178,23 @@ test("only the found owner can issue a hashed handover code; claimant confirms i
   ].sort());
 });
 
+test("found owner can verify and approve a direct-recovery claim", async () => {
+  const directMatch = await createClaimableMatch();
+  const directClaim = await submitClaim(directMatch);
+  const verification = await api(`/api/claims/${directClaim.claim_id}/verifications`, {
+    method: "POST",
+    token: foundOwnerToken,
+    body: JSON.stringify({ verificationType: "OWNERSHIP_VERIFICATION", status: "PASSED" }),
+  });
+  assert.equal(verification.status, 201, await verification.clone().text());
+  const approved = await api(`/api/claims/${directClaim.claim_id}/review`, {
+    method: "PATCH",
+    token: foundOwnerToken,
+    body: JSON.stringify({ decision: "APPROVED" }),
+  });
+  assert.equal(approved.status, 200, await approved.clone().text());
+});
+
 test("expired handover codes cannot complete and may be replaced", async () => {
   const matchId = await createClaimableMatch();
   const claim = await submitClaim(matchId);
@@ -1136,7 +1203,7 @@ test("expired handover codes cannot complete and may be replaced", async () => {
 
   const issueCode = () => api(`/api/claims/${claim.claim_id}/handover/code`, {
     method: "POST",
-    token: foundOwnerToken,
+    token,
   });
   const firstIssue = await issueCode();
   assert.equal(firstIssue.status, 201);
@@ -1149,7 +1216,7 @@ test("expired handover codes cannot complete and may be replaced", async () => {
 
   const expired = await api(`/api/claims/${claim.claim_id}/handover/confirm`, {
     method: "POST",
-    token,
+    token: foundOwnerToken,
     body: JSON.stringify({ code: firstCode }),
   });
   assert.equal(expired.status, 410);
@@ -1176,7 +1243,7 @@ test("invalid handover codes are audited and rate limited", async () => {
 
   const issued = await api(`/api/claims/${claim.claim_id}/handover/code`, {
     method: "POST",
-    token: foundOwnerToken,
+    token,
   });
   assert.equal(issued.status, 201);
   const code = (await issued.json()).code;
@@ -1185,7 +1252,7 @@ test("invalid handover codes are audited and rate limited", async () => {
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const response = await api(`/api/claims/${claim.claim_id}/handover/confirm`, {
       method: "POST",
-      token,
+      token: foundOwnerToken,
       body: JSON.stringify({ code: wrongCode }),
     });
     assert.equal(response.status, 400);
@@ -1193,7 +1260,7 @@ test("invalid handover codes are audited and rate limited", async () => {
 
   const rateLimited = await api(`/api/claims/${claim.claim_id}/handover/confirm`, {
     method: "POST",
-    token,
+    token: foundOwnerToken,
     body: JSON.stringify({ code }),
   });
   assert.equal(rateLimited.status, 429);
@@ -1202,7 +1269,7 @@ test("invalid handover codes are audited and rate limited", async () => {
     `SELECT COUNT(*)::int AS count FROM audit_logs
      WHERE actor_user_id = $1 AND entity_type = 'CLAIM' AND entity_id = $2
        AND action_type = 'HANDOVER_CODE_REJECTED'`,
-    [userId, claim.claim_id]
+    [foundOwnerId, claim.claim_id]
   );
   assert.equal(attempts.rows[0].count, 5);
 });
@@ -1215,14 +1282,14 @@ test("concurrent handover confirmations complete exactly once", async () => {
 
   const issued = await api(`/api/claims/${claim.claim_id}/handover/code`, {
     method: "POST",
-    token: foundOwnerToken,
+    token,
   });
   assert.equal(issued.status, 201);
   const code = (await issued.json()).code;
 
   const confirm = () => api(`/api/claims/${claim.claim_id}/handover/confirm`, {
     method: "POST",
-    token,
+    token: foundOwnerToken,
     body: JSON.stringify({ code }),
   });
   const responses = await Promise.all([confirm(), confirm()]);

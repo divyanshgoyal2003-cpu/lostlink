@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import {
   confirmHandover,
+  enableClaimConversation,
   getClaimReviewQueue,
   getClaimVerifications,
   getMyClaims,
@@ -12,6 +13,7 @@ import {
 import './ClaimWorkflow.css'
 import ClaimPhotoAccess from './ClaimPhotoAccess'
 import ConversationPanel from './ConversationPanel'
+import ConversationInbox from './ConversationInbox'
 
 const REVIEW_ROLES = ['STAFF', 'ADMIN']
 
@@ -30,7 +32,7 @@ function readableError(error) {
   if (error.status === 403) return 'Your account is not authorized for this action.'
   if (error.status === 404) return 'This claim is no longer available.'
   if (error.status === 409) return error.message || 'The claim changed. Refresh and try again.'
-  if (error.status === 410) return 'This handover code expired. Ask the found-item owner for a new code.'
+  if (error.status === 410) return 'This handover code expired. Request a fresh code from My Claims.'
   if (error.status === 429) return 'Too many incorrect codes were entered. Try again after the limit resets.'
   return error.message || 'Something went wrong. Please try again.'
 }
@@ -39,12 +41,12 @@ function statusDescription(status, relationship) {
   if (status === 'SUBMITTED') return 'Waiting for the assigned review team.'
   if (status === 'IN_REVIEW') return 'A reviewer is checking the claim.'
   if (status === 'APPROVED' && relationship === 'FOUND_REPORT_OWNER') {
-    return 'The assigned authority manages claimant release after receiving the item.'
+    return 'The claimant gets a one-time code and shows it to you; confirm the safe return after receiving the item.'
   }
   if (status === 'APPROVED' && relationship === 'AUTHORITY_CLAIMANT') {
-    return 'Enter the one-time release code provided by the assigned authority.'
+    return 'Get your one-time return code here and show it to the assigned authority.'
   }
-  if (status === 'APPROVED') return 'Enter the code provided by the found-item owner to confirm handover.'
+  if (status === 'APPROVED') return 'Get your one-time return code here and show it to the finder.'
   if (status === 'REJECTED') return 'This claim was rejected. Contact support if you need help.'
   if (status === 'COMPLETED') return 'Handover confirmed.'
   if (status === 'WITHDRAWN') return 'This claim was withdrawn.'
@@ -56,6 +58,7 @@ function updateById(setter, id, value) {
 }
 
 function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hidePersonalClaims = false }) {
+  const activeClaims = claims.filter((claim) => claim.claim_status !== 'COMPLETED')
   const [hasAuthorityMembership, setHasAuthorityMembership] = useState(false)
   const isReviewer = REVIEW_ROLES.includes(user?.role) || hasAuthorityMembership
   const [claimsLoading, setClaimsLoading] = useState(false)
@@ -175,7 +178,7 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hi
     const key = `verify-${id}`
     await runAction(key, async () => {
       await submitClaimVerification(token, id, draft)
-      await Promise.all([loadReviewQueue(), loadClaims()])
+      await Promise.all([isReviewer ? loadReviewQueue() : Promise.resolve(), loadClaims()])
     }, 'Verification recorded. Review the updated status before deciding.')
   }
 
@@ -186,6 +189,16 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hi
       await reviewClaim(token, id, decision, decisionNotes[id] || '')
       await Promise.all([refreshWorkflow(), onRefresh?.()])
     }, `Claim ${decision.toLowerCase()}.`)
+  }
+
+  async function handleEnableChat(claim) {
+    const id = claim.claim_id
+    const key = `enable-chat-${id}`
+    await runAction(key, async () => {
+      await enableClaimConversation(token, id)
+      updateById(setReviewOptions, id, true)
+      await Promise.all([loadReviewQueue(), loadClaims()])
+    }, 'Chat is enabled for this claim.')
   }
 
   async function handleHistory(claimId) {
@@ -209,7 +222,7 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hi
       // Keep the one-time code in component memory only while it is being displayed.
       updateById(setIssuedCodes, id, result.code)
       await loadClaims()
-    }, 'Code issued. Share it directly with the claimant; it expires in 15 minutes.')
+    }, 'Your one-time code is ready. Show it only to the person handing the item to you; it expires in 15 minutes.')
   }
 
   async function handleConfirmHandover(claim) {
@@ -232,6 +245,7 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hi
           <h2 id="my-claims-title">My claims</h2>
           <p>Track review progress and confirm a safe handover when a claim is approved.</p>
         </div>
+        <ConversationInbox token={token} />
 
         {!user ? (
           <div className="my-reports-empty"><p>Log in to submit and track claims.</p></div>
@@ -242,16 +256,16 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hi
             <p className="auth-error" role="alert">{claimsError}</p>
             <button className="btn btn-secondary" onClick={loadClaims}>Try again</button>
           </div>
-        ) : claims.length === 0 ? (
+        ) : activeClaims.length === 0 ? (
           <div className="my-reports-empty">
             <div className="placeholder-icon" aria-hidden="true">✓</div>
-            <h3>No claims yet</h3>
-            <p>When you claim a possible match, its progress will appear here.</p>
-            <a className="btn btn-primary" href="#my-matches">View matches</a>
+            <h3>{claims.length ? 'No active claims' : 'No claims yet'}</h3>
+            <p>{claims.length ? 'Completed returns are available in Return history.' : 'When you claim a possible match, its progress will appear here.'}</p>
+            {claims.length ? <a className="btn btn-secondary" href="#return-history">View return history</a> : <a className="btn btn-primary" href="#my-matches">View matches</a>}
           </div>
         ) : (
           <div className="my-reports-list">
-            {claims.map((claim) => {
+            {activeClaims.map((claim) => {
               const id = claim.claim_id
               const relationship = claim.current_user_relationship
               const actionKey = `claim-${id}`
@@ -270,61 +284,84 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hi
                     ? 'The assigned authority has physical custody and manages claimant release.'
                     : statusDescription(claim.claim_status, relationship === 'CLAIMANT' && claim.authority_custody_received ? 'AUTHORITY_CLAIMANT' : relationship)}</p>
                   <ClaimPhotoAccess token={token} claimId={id} onRefresh={onRefresh} />
-                  {claim.conversation_status === 'OPEN' && <ConversationPanel token={token} claimId={id} title={claim.found_recovery_mode === 'AUTHORITY' ? 'Chat with the assigned authority' : 'Chat with the found-item owner'} />}
-
-                  {claim.claim_status === 'APPROVED' && relationship === 'FOUND_REPORT_OWNER' && !claim.authority_custody_received && (
-                    <div className="claim-handover-box">
-                      <p>Request a fresh code only when you are ready to hand over the item. The code is single-use and expires in 15 minutes.</p>
-                      {issuedCodes[id] ? (
-                        <div className="handover-code-display" role="status" aria-live="polite">
-                          <span>Share this code with the claimant:</span>
-                          <strong aria-label={`Handover code ${issuedCodes[id]}`}>{issuedCodes[id]}</strong>
-                          <button type="button" className="btn btn-secondary" onClick={() => updateById(setIssuedCodes, id, '')}>Hide code</button>
-                        </div>
-                      ) : (
+                  {relationship === 'FOUND_REPORT_OWNER' && claim.found_recovery_mode === 'DIRECT' &&
+                    ['SUBMITTED', 'IN_REVIEW', 'APPROVED'].includes(claim.claim_status) &&
+                    claim.conversation_status !== 'OPEN' && claim.conversation_status !== 'CLOSED' && (
+                      <div className="claim-chat-action">
                         <button
                           type="button"
                           className="btn btn-primary"
-                          disabled={pendingAction === `issue-code-${id}`}
-                          onClick={() => handleIssueCode(claim)}
+                          disabled={pendingAction === `enable-chat-${id}`}
+                          onClick={() => handleEnableChat(claim)}
                         >
-                          {pendingAction === `issue-code-${id}` ? 'Requesting code…' : 'Request handover code'}
+                          {pendingAction === `enable-chat-${id}` ? 'Enabling chat…' : 'Enable chat for this claim'}
                         </button>
-                      )}
+                        {actionErrors[`enable-chat-${id}`] && <p className="auth-error" role="alert">{actionErrors[`enable-chat-${id}`]}</p>}
+                        {feedback[`enable-chat-${id}`] && <p className="claim-feedback" role="status">{feedback[`enable-chat-${id}`]}</p>}
+                      </div>
+                    )}
+                  {relationship === 'CLAIMANT' && claim.conversation_status !== 'OPEN' &&
+                    ['SUBMITTED', 'IN_REVIEW', 'APPROVED'].includes(claim.claim_status) && (
+                      <p className="claim-chat-note" role="status">
+                        {claim.found_recovery_mode === 'AUTHORITY'
+                          ? 'Chat will be available after the assigned authority enables it.'
+                          : 'Chat will be available after the found-item owner enables it.'}
+                      </p>
+                    )}
+                  {claim.conversation_status === 'OPEN' && <ConversationPanel token={token} claimId={id} title={claim.found_recovery_mode === 'AUTHORITY' ? 'Chat with the assigned authority' : 'Chat with the found-item owner'} />}
+
+                  {claim.claim_status === 'APPROVED' && relationship === 'FOUND_REPORT_OWNER' && claim.found_recovery_mode === 'DIRECT' && (
+                    <div className="claim-handover-box">
+                      <form className="claim-code-form" onSubmit={(event) => { event.preventDefault(); handleConfirmHandover(claim) }}>
+                        <p>The claimant will show you their one-time code. Confirm only after the item is safely returned.</p>
+                        <label htmlFor={`handover-code-${id}`}>Claimant’s handover code</label>
+                        <input id={`handover-code-${id}`} inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{8}" maxLength={8} value={codeInputs[id] || ''} onChange={(event) => updateById(setCodeInputs, id, event.target.value.replace(/\D/g, '').slice(0, 8))} required />
+                        <button className="btn btn-primary" type="submit" disabled={pendingAction === `confirm-${id}` || (codeInputs[id] || '').length !== 8}>
+                          {pendingAction === `confirm-${id}` ? 'Confirming…' : 'Confirm safe handover'}
+                        </button>
+                        {actionErrors[`confirm-${id}`] && <p className="auth-error" role="alert">{actionErrors[`confirm-${id}`]}</p>}
+                      </form>
+                    </div>
+                  )}
+
+                  {claim.claim_status === 'APPROVED' && relationship === 'CLAIMANT' && (
+                    <div className="claim-handover-box claim-code-form">
+                      <p>Get your private one-time code after approval and show it to the finder{claim.found_recovery_mode === 'AUTHORITY' ? ' or assigned authority' : ''} when you receive the item. It expires in 15 minutes and can be used once.</p>
+                      {issuedCodes[id] ? <div className="handover-code-display" role="status" aria-live="polite">
+                        <span>Show this code to the person handing over the item:</span>
+                        <strong aria-label={`Handover code ${issuedCodes[id]}`}>{issuedCodes[id]}</strong>
+                        <button type="button" className="btn btn-secondary" onClick={() => updateById(setIssuedCodes, id, '')}>Hide code</button>
+                      </div> : claim.handover_status === 'CODE_ISSUED' && new Date(claim.handover_code_expires_at).getTime() > Date.now()
+                        ? <p role="status">A code was already generated for this claim. It expires {new Date(claim.handover_code_expires_at).toLocaleString()}; a new code can be requested after that if needed.</p>
+                        : <button type="button" className="btn btn-primary" disabled={pendingAction === `issue-code-${id}`} onClick={() => handleIssueCode(claim)}>
+                        {pendingAction === `issue-code-${id}` ? 'Preparing code…' : 'Get one-time handover code'}
+                      </button>}
                       {feedback[`issue-code-${id}`] && <p className="claim-feedback" role="status">{feedback[`issue-code-${id}`]}</p>}
                       {actionErrors[`issue-code-${id}`] && <p className="auth-error" role="alert">{actionErrors[`issue-code-${id}`]}</p>}
                     </div>
                   )}
 
-                  {claim.claim_status === 'APPROVED' && relationship === 'CLAIMANT' && (
-                    <form
-                      className="claim-handover-box claim-code-form"
-                      onSubmit={(event) => { event.preventDefault(); handleConfirmHandover(claim) }}
-                    >
-                      <p>Enter the 8-digit code from the found-item owner. It can be used once and expires 15 minutes after issue.</p>
-                      <label htmlFor={`handover-code-${id}`}>Handover code</label>
-                      <input
-                        id={`handover-code-${id}`}
-                        inputMode="numeric"
-                        autoComplete="one-time-code"
-                        pattern="[0-9]{8}"
-                        maxLength={8}
-                        value={codeInputs[id] || ''}
-                        onChange={(event) => updateById(setCodeInputs, id, event.target.value.replace(/\D/g, '').slice(0, 8))}
-                        aria-describedby={`handover-help-${id}`}
-                        required
-                      />
-                      <small id={`handover-help-${id}`}>The code is checked securely and is never saved in your session.</small>
-                      <button
-                        className="btn btn-primary"
-                        type="submit"
-                        disabled={pendingAction === `confirm-${id}` || (codeInputs[id] || '').length !== 8}
-                      >
-                        {pendingAction === `confirm-${id}` ? 'Confirming…' : 'Confirm handover'}
-                      </button>
-                      {actionErrors[`confirm-${id}`] && <p className="auth-error" role="alert">{actionErrors[`confirm-${id}`]}</p>}
-                    </form>
-                  )}
+                  {relationship === 'FOUND_REPORT_OWNER' && claim.found_recovery_mode === 'DIRECT' && ['SUBMITTED', 'IN_REVIEW'].includes(claim.claim_status) && (() => {
+                    const draft = verificationDrafts[id] || { verificationType: 'OWNERSHIP_VERIFICATION', status: 'NEEDS_REVIEW', privateNote: '' }
+                    const canApprove = claim.claim_status === 'IN_REVIEW' && claim.latest_verification_status === 'PASSED'
+                    return <div className="claim-review-form founder-claim-review">
+                      <h3>Review this ownership claim</h3>
+                      <label htmlFor={`founder-verification-result-${id}`}>Ownership verification</label>
+                      <select id={`founder-verification-result-${id}`} value={draft.status} onChange={(event) => updateById(setVerificationDrafts, id, { ...draft, status: event.target.value })}>
+                        <option value="NEEDS_REVIEW">Needs more review</option><option value="PASSED">Passed</option><option value="FAILED">Failed</option>
+                      </select>
+                      <label htmlFor={`founder-verification-note-${id}`}>Private verification note</label>
+                      <textarea id={`founder-verification-note-${id}`} rows={2} maxLength={2000} value={draft.privateNote} onChange={(event) => updateById(setVerificationDrafts, id, { ...draft, privateNote: event.target.value })} />
+                      <button type="button" className="btn btn-secondary" disabled={pendingAction === `verify-${id}`} onClick={() => handleVerification(claim)}>{pendingAction === `verify-${id}` ? 'Saving…' : 'Record verification'}</button>
+                      {claim.claim_status === 'IN_REVIEW' && <div className="claim-review-actions">
+                        <button type="button" className="btn btn-primary" disabled={!canApprove || pendingAction === `decision-${id}`} onClick={() => handleDecision(claim, 'APPROVED')}>Approve claim</button>
+                        <button type="button" className="btn btn-secondary" disabled={pendingAction === `decision-${id}`} onClick={() => handleDecision(claim, 'REJECTED')}>Reject claim</button>
+                      </div>}
+                      {!canApprove && <small>Approval requires a passed ownership verification.</small>}
+                      {actionErrors[`verify-${id}`] && <p className="auth-error" role="alert">{actionErrors[`verify-${id}`]}</p>}
+                      {actionErrors[`decision-${id}`] && <p className="auth-error" role="alert">{actionErrors[`decision-${id}`]}</p>}
+                    </div>
+                  })()}
 
                   {feedback[actionKey] && <p className="claim-feedback" role="status">{feedback[actionKey]}</p>}
                   {actionErrors[actionKey] && <p className="auth-error" role="alert">{actionErrors[actionKey]}</p>}
@@ -362,6 +399,9 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hi
                   privateNote: '',
                 }
                 const canApprove = claim.claim_status === 'IN_REVIEW' && claim.latest_verification_status === 'PASSED'
+                const canEnableAuthorityChat = claim.found_recovery_mode === 'AUTHORITY' &&
+                  claim.authority_custody_received && hasAuthorityMembership &&
+                  ['SUBMITTED', 'IN_REVIEW', 'APPROVED'].includes(claim.claim_status)
                 const actionKey = `verify-${id}`
                 return (
                   <article className="my-report-card claim-review-card" key={id}>
@@ -402,13 +442,27 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hi
 
                     <button
                       type="button"
-                      className="btn btn-primary claim-enable-chat"
+                      className="btn btn-secondary claim-enable-chat"
                       aria-expanded={Boolean(reviewOptions[id])}
                       aria-controls={`claim-review-options-${id}`}
                       onClick={() => updateById(setReviewOptions, id, !reviewOptions[id])}
                     >
-                      {reviewOptions[id] ? 'Hide chat and review options' : 'Enable chat'}
+                      {reviewOptions[id] ? 'Hide chat and review options' : 'Open chat and review options'}
                     </button>
+                    {canEnableAuthorityChat && claim.conversation_status !== 'OPEN' && claim.conversation_status !== 'CLOSED' && (
+                      <div className="claim-chat-action">
+                        <button
+                          type="button"
+                          className="btn btn-primary"
+                          disabled={pendingAction === `enable-chat-${id}`}
+                          onClick={() => handleEnableChat(claim)}
+                        >
+                          {pendingAction === `enable-chat-${id}` ? 'Enabling chat…' : 'Enable chat for this claim'}
+                        </button>
+                        {actionErrors[`enable-chat-${id}`] && <p className="auth-error" role="alert">{actionErrors[`enable-chat-${id}`]}</p>}
+                        {feedback[`enable-chat-${id}`] && <p className="claim-feedback" role="status">{feedback[`enable-chat-${id}`]}</p>}
+                      </div>
+                    )}
                     <div id={`claim-review-options-${id}`} hidden={!reviewOptions[id]}>
                     {reviewOptions[id] && <>
                       {claim.conversation_status === 'OPEN'

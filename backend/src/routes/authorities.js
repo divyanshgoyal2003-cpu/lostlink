@@ -517,19 +517,20 @@ router.post("/reports/:reportId/custody-transfers", async (req, res) => {
 });
 
 router.get("/cases", async (req, res) => {
+  const historyView = req.query.history === "true";
   try {
     const result = await pool.query(
-      `SELECT r.report_id, r.status AS report_status, r.report_time, r.recovery_mode,
+      `SELECT r.report_id, r.status AS report_status, r.report_time, r.updated_at, r.recovery_mode,
               ad.authority_id, ad.name AS authority_name, ad.destination_type,
               CASE WHEN ctr.custody_status='RECEIVED' THEN i.title END AS title,
-              CASE WHEN ctr.custody_status='RECEIVED' THEN i.description END AS description,
+              CASE WHEN ctr.custody_status='RECEIVED' AND $2::boolean = FALSE THEN i.description END AS description,
               CASE WHEN ctr.custody_status='RECEIVED' THEN i.category END AS category,
-              CASE WHEN ctr.custody_status='RECEIVED' THEN i.color END AS color,
-              CASE WHEN ctr.custody_status='RECEIVED' THEN r.location_description END AS location_description,
-              CASE WHEN ctr.custody_status='RECEIVED' THEN i.attributes_json->>'company' END AS company,
-              CASE WHEN ctr.custody_status='RECEIVED' THEN i.attributes_json->>'model' END AS model,
-              CASE WHEN ctr.custody_status='RECEIVED' THEN i.attributes_json END AS item_attributes,
-              CASE WHEN ctr.custody_status='RECEIVED' THEN COALESCE((
+              CASE WHEN ctr.custody_status='RECEIVED' AND $2::boolean = FALSE THEN i.color END AS color,
+              CASE WHEN ctr.custody_status='RECEIVED' AND $2::boolean = FALSE THEN r.location_description END AS location_description,
+              CASE WHEN ctr.custody_status='RECEIVED' AND $2::boolean = FALSE THEN i.attributes_json->>'company' END AS company,
+              CASE WHEN ctr.custody_status='RECEIVED' AND $2::boolean = FALSE THEN i.attributes_json->>'model' END AS model,
+              CASE WHEN ctr.custody_status='RECEIVED' AND $2::boolean = FALSE THEN i.attributes_json END AS item_attributes,
+              CASE WHEN ctr.custody_status='RECEIVED' AND $2::boolean = FALSE THEN COALESCE((
                 SELECT json_agg(json_build_object(
                   'photoId', p.photo_id, 'photoType', p.photo_type, 'uploadedAt', p.uploaded_at
                 ) ORDER BY p.photo_type, p.photo_id)
@@ -540,13 +541,20 @@ router.get("/cases", async (req, res) => {
               CASE WHEN ctr.custody_status='RECEIVED' THEN COALESCE((
                 SELECT json_agg(json_build_object(
                   'claim_id', c.claim_id, 'claim_status', c.claim_status,
-                  'claimant_name', claimant.name, 'conversation_status', conv.conversation_status
+                  'claimant_name', CASE WHEN $2::boolean = FALSE THEN claimant.name END,
+                  'conversation_status', CASE WHEN $2::boolean = FALSE THEN conv.conversation_status END,
+                  'handover_status', hr.handover_status,
+                  'completed_at', hr.completed_at
                 ) ORDER BY c.submitted_at DESC)
                 FROM claim_requests c
                 JOIN match_records m ON m.match_id=c.match_id
                 JOIN users claimant ON claimant.user_id=c.claimant_user_id
                 LEFT JOIN conversations conv ON conv.claim_id=c.claim_id
-                WHERE m.found_report_id=r.report_id AND c.claim_status IN ('SUBMITTED','IN_REVIEW','APPROVED')
+                LEFT JOIN handover_records hr ON hr.claim_id=c.claim_id
+                WHERE m.found_report_id=r.report_id AND (
+                  ($2::boolean = FALSE AND c.claim_status IN ('SUBMITTED','IN_REVIEW','APPROVED')) OR
+                  ($2::boolean = TRUE AND c.claim_status = 'COMPLETED')
+                )
               ), '[]'::json) ELSE '[]'::json END AS claims,
               CASE WHEN EXISTS (SELECT 1 FROM custody_transfer_requests confirmed
                                 WHERE confirmed.report_id=r.report_id AND confirmed.custody_status='RECEIVED')
@@ -562,8 +570,10 @@ router.get("/cases", async (req, res) => {
        WHERE am.user_id = $1 AND am.membership_status = 'ACTIVE'
          AND ad.verification_status = 'VERIFIED' AND ad.destination_status = 'ACTIVE'
          AND u.account_status = 'ACTIVE' AND r.report_type = 'FOUND' AND r.recovery_mode = 'AUTHORITY'
+         AND (($2::boolean = TRUE AND r.status = 'RETURNED' AND ctr.custody_status = 'RECEIVED')
+           OR ($2::boolean = FALSE AND r.status <> 'RETURNED'))
        ORDER BY r.updated_at DESC, r.report_id DESC LIMIT 200`,
-      [req.user.userId]
+      [req.user.userId, historyView]
     );
     return res.json({ cases: result.rows });
   } catch (error) {

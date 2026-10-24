@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import {
   getNotifications,
   getUnreadNotificationCount,
+  clearAllNotifications,
   markAllNotificationsRead,
   markNotificationRead,
 } from '../api'
@@ -23,6 +24,7 @@ function NotificationCenter({ token }) {
   const [unreadCount, setUnreadCount] = useState(0)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [clearing, setClearing] = useState(false)
 
   const refresh = useCallback(async (includeList = open) => {
     if (!token) return
@@ -88,6 +90,22 @@ function NotificationCenter({ token }) {
     }
   }
 
+  async function clearAll() {
+    if (notifications.length === 0 || clearing) return
+    if (!window.confirm('Clear all notifications? This removes them from your notification history.')) return
+    setClearing(true)
+    setError('')
+    try {
+      await clearAllNotifications(token)
+      setNotifications([])
+      setUnreadCount(0)
+    } catch (clearError) {
+      setError(clearError.message || 'Could not clear notifications.')
+    } finally {
+      setClearing(false)
+    }
+  }
+
   return (
     <div className="notification-center">
       <button type="button" className="btn btn-ghost notification-toggle" aria-expanded={open} aria-controls="notification-panel" onClick={togglePanel}>
@@ -98,7 +116,12 @@ function NotificationCenter({ token }) {
         <section className="notification-panel" id="notification-panel" aria-label="Notifications">
           <div className="notification-panel-heading">
             <h2>Notifications</h2>
-            <button type="button" className="btn btn-ghost" onClick={markAllRead} disabled={unreadCount === 0}>Mark all read</button>
+            <div className="notification-actions">
+              <button type="button" className="btn btn-ghost" onClick={markAllRead} disabled={unreadCount === 0}>Mark all read</button>
+              <button type="button" className="btn btn-ghost" onClick={clearAll} disabled={notifications.length === 0 || clearing}>
+                {clearing ? 'Clearing…' : 'Clear all'}
+              </button>
+            </div>
           </div>
           {error && <p className="notification-error" role="alert">{error}</p>}
           {loading ? <p role="status">Loading notifications…</p> : notifications.length === 0 ? (

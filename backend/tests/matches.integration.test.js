@@ -251,6 +251,7 @@ test("general report browsing is retired and does not expose arbitrary report de
 
 test("My Reports remains owner-scoped after general browsing is retired", async () => {
   const createResponse = await createReportViaApi({
+    reportType: "FOUND",
     title: "Owner report management test",
     description: "Owner-only description",
   });
@@ -264,6 +265,15 @@ test("My Reports remains owner-scoped after general browsing is retired", async 
   const body = await response.json();
   assert.ok(body.reports.some((report) => String(report.report_id) === String(created.report.report_id)));
   assert.ok(body.reports.some((report) => report.title === "Owner report management test"));
+
+  await pool.query("UPDATE reports SET status = 'RETURNED', updated_at = NOW() WHERE report_id = $1", [created.report.report_id]);
+  const activeResponse = await api("/api/reports/mine", { authenticated: true });
+  assert.equal((await activeResponse.json()).reports.some((report) => String(report.report_id) === String(created.report.report_id)), false);
+  const historyResponse = await api("/api/reports/mine/history", { authenticated: true });
+  const history = await historyResponse.json();
+  assert.equal(historyResponse.status, 200);
+  assert.equal(history.reports.some((report) => String(report.report_id) === String(created.report.report_id)), true);
+  assert.equal(JSON.stringify(history).includes("photo_storage_key"), false);
 });
 
 test("My Matches never returns found-item free text that could reveal verification details", async () => {

@@ -242,6 +242,8 @@
 .claim-review-report-details h4 { margin: 0 0 0.45rem; overflow-wrap: anywhere; }
 .claim-review-report-details p { margin: 0.35rem 0; color: #52645d; line-height: 1.5; overflow-wrap: anywhere; }
 .claim-enable-chat { align-self: flex-start; }
+.claim-chat-action { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; margin: 0.75rem 0; }
+.claim-chat-action p { flex-basis: 100%; margin: 0; }
 .claim-chat-note { margin: 0; color: #61726d; }
 
 @media (max-width: 640px) {
