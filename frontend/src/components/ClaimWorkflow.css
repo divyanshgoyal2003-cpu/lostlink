@@ -211,3 +211,40 @@
     flex-direction: column;
   }
 }
+
+.claim-review-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  width: 100%;
+  gap: 0.75rem;
+  padding: 0.9rem;
+  border: 1px solid #e2eae5;
+  border-radius: 12px;
+  background: #fbfcfb;
+}
+
+.claim-review-summary > div { display: grid; gap: 0.25rem; }
+.claim-review-summary span { color: #52645d; }
+.claim-review-reports {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  width: 100%;
+  gap: 0.85rem;
+}
+.claim-review-report-details {
+  min-width: 0;
+  padding: 1rem;
+  border: 1px solid #dce6df;
+  border-radius: 12px;
+  background: #f7faf7;
+}
+.claim-review-report-details h3 { margin: 0 0 0.5rem; color: #29463e; font-size: 0.95rem; }
+.claim-review-report-details h4 { margin: 0 0 0.45rem; overflow-wrap: anywhere; }
+.claim-review-report-details p { margin: 0.35rem 0; color: #52645d; line-height: 1.5; overflow-wrap: anywhere; }
+.claim-enable-chat { align-self: flex-start; }
+.claim-chat-note { margin: 0; color: #61726d; }
+
+@media (max-width: 640px) {
+  .claim-review-reports { grid-template-columns: 1fr; }
+  .claim-enable-chat { width: 100%; }
+}

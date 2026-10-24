@@ -8,6 +8,7 @@ const {
 } = require("../config/matching");
 
 const router = express.Router();
+const { createNotification } = require("../notifications");
 
 /*
  * Shared candidate query.
@@ -480,6 +481,11 @@ router.get("/", async (req, res) => {
              saved.match_status AS saved_match_status,
              saved.calculated_at AS saved_calculated_at,
              saved.total_score AS saved_total_score,
+             f.recovery_mode AS found_recovery_mode,
+             (f.recovery_mode = 'DIRECT' OR EXISTS (
+               SELECT 1 FROM custody_transfer_requests ctr
+               WHERE ctr.report_id=f.report_id AND ctr.custody_status='RECEIVED'
+             )) AS found_available_to_claim,
              COALESCE(saved.calculated_at, GREATEST(l.created_at, f.created_at)) AS matched_at
       FROM (${candidateQuery}) AS m
       JOIN reports l ON l.report_id = m.lost_report_id
@@ -512,7 +518,7 @@ router.get("/", async (req, res) => {
           Math.round(Number(match.distance_m) / 100) * 100,
         daysApart: Number(match.days_apart),
         status: match.saved_match_status || "CANDIDATE",
-        canClaim: match.saved_match_id != null &&
+        canClaim: match.saved_match_id != null && match.found_available_to_claim &&
           ["CANDIDATE", "CHAT_ENABLED"].includes(match.saved_match_status || "CANDIDATE"),
       })),
       note: "Match scores are estimates, not probabilities or proof of ownership.",
@@ -557,6 +563,13 @@ router.post("/refresh", async (req, res) => {
 
     // Persist candidates individually using the unique report-pair constraint.
     for (const match of candidates) {
+      // The refresh-wide advisory lock makes this existence check and insert
+      // one idempotent decision for each persisted report pair.
+      const priorMatch = await client.query(
+        `SELECT match_id FROM match_records
+         WHERE lost_report_id = $1 AND found_report_id = $2`,
+        [match.lost_report_id, match.found_report_id]
+      );
       const breakdown = {
         location_score: Number(match.location_score),
         category_score: Number(match.category_score),
@@ -612,6 +625,15 @@ router.post("/refresh", async (req, res) => {
 
       if (saved.rowCount > 0) {
         insertedOrUpdated++;
+        if (!priorMatch.rowCount) {
+          await createNotification(
+            client,
+            req.user.userId,
+            "MATCH_FOUND",
+            "MATCH",
+            saved.rows[0].match_id
+          );
+        }
       }
     }
 

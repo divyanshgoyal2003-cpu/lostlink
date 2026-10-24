@@ -174,6 +174,15 @@ async function createReportViaApi(overrides = {}) {
 afterEach(async () => {
   if (reportIds.length > 0) {
     await pool.query(
+      `DELETE FROM notifications
+       WHERE user_id = $1 AND reference_type = 'MATCH'
+         AND reference_id IN (
+           SELECT match_id FROM match_records
+           WHERE lost_report_id = ANY($2::bigint[]) OR found_report_id = ANY($2::bigint[])
+         )`,
+      [userId, reportIds]
+    );
+    await pool.query(
       `DELETE FROM match_records
        WHERE lost_report_id = ANY($1::bigint[])
           OR found_report_id = ANY($1::bigint[])`,
@@ -463,6 +472,28 @@ test("POST /api/matches/refresh persists the production model score", async () =
   assert.equal(persisted.rowCount, 1);
   assert.equal(persisted.rows[0].match_status, "CANDIDATE");
   assert.equal(persisted.rows[0].model_score, "100");
+
+  const matchId = (await pool.query(
+    `SELECT match_id FROM match_records WHERE lost_report_id = $1 AND found_report_id = $2`,
+    [lostReportId, foundReportId]
+  )).rows[0].match_id;
+  const firstEventCount = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM notifications
+     WHERE user_id = $1 AND notification_type = 'MATCH_FOUND'
+       AND reference_type = 'MATCH' AND reference_id = $2`,
+    [userId, matchId]
+  );
+  assert.equal(firstEventCount.rows[0].count, 1);
+
+  const repeatedRefresh = await api("/api/matches/refresh", { method: "POST", authenticated: true });
+  assert.equal(repeatedRefresh.status, 200);
+  const repeatedEventCount = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM notifications
+     WHERE user_id = $1 AND notification_type = 'MATCH_FOUND'
+       AND reference_type = 'MATCH' AND reference_id = $2`,
+    [userId, matchId]
+  );
+  assert.equal(repeatedEventCount.rows[0].count, 1);
 });
 test("electronics reports reject a missing model", async () => {
   const response = await createReportViaApi({

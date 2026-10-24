@@ -1,8 +1,12 @@
 
 require("dotenv").config();
+const fs = require("node:fs/promises");
+const os = require("node:os");
+const path = require("node:path");
 
 // Force this test process to use the isolated database.
 process.env.DB_NAME = "lostlink_test";
+process.env.PRIVATE_PHOTO_DIR = path.join(os.tmpdir(), `lostlink-private-photos-${process.pid}`);
 
 const assert = require("node:assert/strict");
 const { before, after, afterEach, test } = require("node:test");
@@ -28,6 +32,7 @@ const reportIds = [];
 const itemIds = [];
 const matchIds = [];
 const claimIds = [];
+const extraRoleUsers = [];
 
 async function api(path, options = {}) {
   const headers = {
@@ -35,6 +40,7 @@ async function api(path, options = {}) {
     ...(options.token
       ? { Authorization: `Bearer ${options.token}` }
       : {}),
+    ...options.headers,
   };
 
   return fetch(`${baseUrl}${path}`, {
@@ -197,6 +203,14 @@ afterEach(async () => {
   // Delete claims before matches because claims reference match_records.
   if (matchIds.length > 0) {
     await pool.query(
+      `DELETE FROM notifications
+       WHERE reference_type = 'CLAIM'
+         AND (reference_id = ANY($2::bigint[]) OR reference_id IN (
+           SELECT claim_id FROM claim_requests WHERE match_id = ANY($1::bigint[])
+         ))`,
+      [matchIds, claimIds]
+    );
+    await pool.query(
       `DELETE FROM handover_records
        WHERE claim_id IN (
          SELECT claim_id FROM claim_requests WHERE match_id = ANY($1::bigint[])
@@ -254,6 +268,8 @@ afterEach(async () => {
   itemIds.length = 0;
   matchIds.length = 0;
   claimIds.length = 0;
+  const storedFiles = await fs.readdir(process.env.PRIVATE_PHOTO_DIR).catch(() => []);
+  await Promise.all(storedFiles.map((file) => fs.unlink(path.join(process.env.PRIVATE_PHOTO_DIR, file))));
 });
 
 before(async () => {
@@ -309,6 +325,7 @@ before(async () => {
   staffToken = jwt.sign({ userId: staffId, role: "STAFF" }, process.env.JWT_SECRET);
 
   assert.ok(token, "Registration should return a JWT");
+  await fs.mkdir(process.env.PRIVATE_PHOTO_DIR, { recursive: true });
 });
 
 after(async () => {
@@ -317,17 +334,18 @@ after(async () => {
       await new Promise((resolve) => server.close(resolve));
     }
 
-    if (userId !== undefined || foundOwnerId !== undefined || staffId !== undefined) {
+    if (userId !== undefined || foundOwnerId !== undefined || staffId !== undefined || extraRoleUsers.length > 0) {
       await pool.query(
         `DELETE FROM users
          WHERE user_id = ANY($1::bigint[])
            AND email = ANY($2::text[])`,
         [
-          [userId, foundOwnerId, staffId].filter((id) => id !== undefined),
-          [userEmail, foundOwnerEmail, staffEmail].filter(Boolean),
+          [userId, foundOwnerId, staffId, ...extraRoleUsers.map((entry) => entry.id)].filter((id) => id !== undefined),
+          [userEmail, foundOwnerEmail, staffEmail, ...extraRoleUsers.map((entry) => entry.email)].filter(Boolean),
         ]
       );
     }
+    await fs.rm(process.env.PRIVATE_PHOTO_DIR, { recursive: true, force: true });
   } finally {
     await pool.end();
   }
@@ -433,6 +451,16 @@ test("POST /api/claims creates a claim for an eligible match", async () => {
   assert.equal(body.claim.claim_status, "SUBMITTED");
 
   claimIds.push(body.claim.claim_id);
+  const events = await pool.query(
+    `SELECT user_id, notification_type FROM notifications
+     WHERE reference_type = 'CLAIM' AND reference_id = $1
+     ORDER BY notification_type`,
+    [body.claim.claim_id]
+  );
+  assert.deepEqual(events.rows.map((row) => `${row.user_id}:${row.notification_type}`).sort(), [
+    `${userId}:CLAIM_SUBMITTED`,
+    `${foundOwnerId}:NEW_CLAIM`,
+  ].sort());
 });
 
 test("POST /api/claims rejects a duplicate active claim", async () => {
@@ -497,6 +525,212 @@ test("POST /api/claims prevents duplicate claims from concurrent requests", asyn
   );
 
   assert.equal(result.rows[0].count, 1);
+});
+
+function validPngFixture() {
+  function crc32(data) {
+    let crc = 0xffffffff;
+    for (const byte of data) {
+      crc ^= byte;
+      for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+  function chunk(type, data) {
+    const name = Buffer.from(type, "ascii");
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(data.length);
+    const checksum = Buffer.alloc(4);
+    checksum.writeUInt32BE(crc32(Buffer.concat([name, data])));
+    return Buffer.concat([length, name, data, checksum]);
+  }
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(1, 0);
+  header.writeUInt32BE(1, 4);
+  header[8] = 8;
+  header[9] = 6;
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  const compressedPixels = require("node:zlib").deflateSync(Buffer.from([0, 255, 0, 0, 255]));
+  return Buffer.concat([signature, chunk("IHDR", header), chunk("IDAT", compressedPixels), chunk("IEND", Buffer.alloc(0))]);
+}
+
+async function uploadPhoto(reportId, photoType, authToken = foundOwnerToken, bytes = validPngFixture()) {
+  return api(`/api/reports/${reportId}/photos`, {
+    method: "PUT",
+    token: authToken,
+    headers: { "Content-Type": "image/png", "X-Photo-Type": photoType },
+    body: bytes,
+  });
+}
+
+test("found photos are private by default and sharing is claim-scoped, revocable, and audited", async () => {
+  const matchId = await createClaimableMatch();
+  const foundReport = await pool.query("SELECT found_report_id FROM match_records WHERE match_id = $1", [matchId]);
+  const foundReportId = foundReport.rows[0].found_report_id;
+  const claim = await submitClaim(matchId);
+
+  const unauthorizedUpload = await uploadPhoto(foundReportId, "FRONT", token);
+  assert.equal(unauthorizedUpload.status, 404);
+  const unauthenticatedUpload = await uploadPhoto(foundReportId, "FRONT", null);
+  assert.equal(unauthenticatedUpload.status, 401);
+  const wrongReportUpload = await uploadPhoto(
+    (await pool.query("SELECT lost_report_id FROM match_records WHERE match_id = $1", [matchId])).rows[0].lost_report_id,
+    "FRONT",
+  );
+  assert.equal(wrongReportUpload.status, 404);
+
+  const uploadResponses = [];
+  for (const photoType of ["FRONT", "BACK", "SIDE"]) {
+    const response = await uploadPhoto(foundReportId, photoType);
+    assert.equal(response.status, 201);
+    const body = await response.json();
+    assert.equal(body.photo.photoType, photoType);
+    assert.equal("storage_key" in body.photo, false);
+    assert.equal(JSON.stringify(body).includes("http"), false);
+    uploadResponses.push(body);
+  }
+  const photoId = uploadResponses[0].photo.photoId;
+  const matchResponse = await api("/api/matches", { token });
+  assert.equal(matchResponse.status, 200);
+  const matchPayload = JSON.stringify(await matchResponse.json());
+  assert.equal(matchPayload.includes("storage_key"), false);
+  assert.equal(matchPayload.includes("photoId"), false);
+  const claimsResponse = await api("/api/claims", { token });
+  const claimsPayload = JSON.stringify(await claimsResponse.json());
+  assert.equal(claimsPayload.includes("storage_key"), false);
+  assert.equal(claimsPayload.includes("photoId"), false);
+  const metadata = await api(`/api/reports/${foundReportId}/photos`, { token: foundOwnerToken });
+  assert.equal(metadata.status, 200);
+  assert.equal(JSON.stringify(await metadata.json()).includes("storage_key"), false);
+  const claimantMetadata = await api(`/api/claims/${claim.claim_id}/photos`, { token });
+  assert.equal(claimantMetadata.status, 200);
+  const privateState = await claimantMetadata.json();
+  assert.equal(privateState.sharingStatus, "PRIVATE");
+  assert.deepEqual(privateState.photos, []);
+
+  const noAuthRetrieval = await api(`/api/reports/photos/${photoId}?claimId=${claim.claim_id}`);
+  assert.equal(noAuthRetrieval.status, 401);
+  const preGrantRetrieval = await api(`/api/reports/photos/${photoId}?claimId=${claim.claim_id}`, { token });
+  assert.equal(preGrantRetrieval.status, 403);
+
+  await pool.query("UPDATE conversations SET conversation_status='CLOSED' WHERE claim_id=$1", [claim.claim_id]);
+  const grantBeforeConversation = await api(`/api/claims/${claim.claim_id}/photo-sharing`, {
+    method: "POST", token: foundOwnerToken,
+  });
+  assert.equal(grantBeforeConversation.status, 409);
+  await pool.query("UPDATE conversations SET conversation_status='OPEN' WHERE claim_id=$1", [claim.claim_id]);
+  await pool.query("INSERT INTO conversations (claim_id, conversation_status) VALUES ($1, 'OPEN') ON CONFLICT (claim_id) DO NOTHING", [claim.claim_id]);
+
+  const claimantCannotGrant = await api(`/api/claims/${claim.claim_id}/photo-sharing`, {
+    method: "POST", token,
+  });
+  assert.equal(claimantCannotGrant.status, 403);
+  const grant = await api(`/api/claims/${claim.claim_id}/photo-sharing`, {
+    method: "POST", token: foundOwnerToken,
+  });
+  assert.equal(grant.status, 201);
+
+  const unrelated = await registerTestUser("Unrelated Photo Test", `photo-unrelated-${process.pid}-${Date.now()}@example.test`);
+  extraRoleUsers.push({ id: unrelated.user.user_id, email: unrelated.user.email });
+  const unrelatedList = await api(`/api/claims/${claim.claim_id}/photos`, { token: unrelated.token });
+  assert.equal(unrelatedList.status, 403);
+  const unrelatedRetrieval = await api(`/api/reports/photos/${photoId}?claimId=${claim.claim_id}`, { token: unrelated.token });
+  assert.equal(unrelatedRetrieval.status, 403);
+
+  const claimantAfterGrant = await api(`/api/claims/${claim.claim_id}/photos`, { token });
+  const sharedState = await claimantAfterGrant.json();
+  assert.equal(sharedState.sharingStatus, "SHARED");
+  assert.equal(sharedState.photos.length, 3);
+  assert.equal(JSON.stringify(sharedState).includes("storage_key"), false);
+  const image = await api(`/api/reports/photos/${photoId}?claimId=${claim.claim_id}`, { token });
+  assert.equal(image.status, 200);
+  assert.equal(image.headers.get("content-type"), "image/png");
+  assert.equal(image.headers.get("cache-control"), "private, no-store");
+  assert.deepEqual(Buffer.from(await image.arrayBuffer()), validPngFixture());
+
+  const finderImage = await api(`/api/reports/photos/${photoId}?reportId=${foundReportId}`, { token: foundOwnerToken });
+  assert.equal(finderImage.status, 200);
+  const wrongFinderImage = await api(`/api/reports/photos/${photoId}?reportId=${foundReportId}`, { token });
+  assert.equal(wrongFinderImage.status, 403);
+
+  const secondClaimant = await registerTestUser("Second Claimant", `claims-second-${process.pid}-${Date.now()}@example.test`);
+  extraRoleUsers.push({ id: secondClaimant.user.user_id, email: secondClaimant.user.email });
+  const otherLostReport = await createReport(secondClaimant.user.user_id, "LOST", "Second claimant lost item");
+  const sameFoundMatch = await createMatch(otherLostReport, foundReportId);
+  const secondClaimResponse = await api("/api/claims", {
+    method: "POST", token: secondClaimant.token, body: JSON.stringify({ matchId: sameFoundMatch }),
+  });
+  assert.equal(secondClaimResponse.status, 201);
+  const secondClaim = (await secondClaimResponse.json()).claim;
+  claimIds.push(secondClaim.claim_id);
+  const secondClaimDenied = await api(`/api/reports/photos/${photoId}?claimId=${secondClaim.claim_id}`, { token: secondClaimant.token });
+  assert.equal(secondClaimDenied.status, 403);
+
+  const revoke = await api(`/api/claims/${claim.claim_id}/photo-sharing`, {
+    method: "DELETE", token: foundOwnerToken,
+  });
+  assert.equal(revoke.status, 200);
+  const afterRevoke = await api(`/api/reports/photos/${photoId}?claimId=${claim.claim_id}`, { token });
+  assert.equal(afterRevoke.status, 403);
+  const audit = await pool.query(
+    `SELECT action_type FROM audit_logs WHERE entity_type = 'CLAIM' AND entity_id = $1
+     AND action_type IN ('CLAIM_PHOTOS_SHARED', 'CLAIM_PHOTOS_REVOKED') ORDER BY action_type`,
+    [claim.claim_id],
+  );
+  assert.deepEqual(audit.rows.map((row) => row.action_type), ["CLAIM_PHOTOS_REVOKED", "CLAIM_PHOTOS_SHARED"]);
+});
+
+test("photo formats and guided replacement are validated; STAFF/ADMIN boundaries are enforced", async () => {
+  const matchId = await createClaimableMatch();
+  const foundReportId = (await pool.query("SELECT found_report_id FROM match_records WHERE match_id = $1", [matchId])).rows[0].found_report_id;
+  const claim = await submitClaim(matchId);
+  const invalid = await uploadPhoto(foundReportId, "FRONT", foundOwnerToken, Buffer.from("not an image"));
+  assert.equal(invalid.status, 415);
+  const mimeMismatch = await api(`/api/reports/${foundReportId}/photos`, {
+    method: "PUT", token: foundOwnerToken,
+    headers: { "Content-Type": "image/jpeg", "X-Photo-Type": "FRONT" },
+    body: validPngFixture(),
+  });
+  assert.equal(mimeMismatch.status, 415);
+  const invalidType = await uploadPhoto(foundReportId, "SERIAL_NUMBER", foundOwnerToken);
+  assert.equal(invalidType.status, 400);
+  const oversized = await uploadPhoto(foundReportId, "FRONT", foundOwnerToken, Buffer.alloc(8 * 1024 * 1024 + 1));
+  assert.equal(oversized.status, 413);
+
+  const first = await uploadPhoto(foundReportId, "FRONT");
+  const firstPhoto = (await first.json()).photo;
+  const replacement = await uploadPhoto(foundReportId, "FRONT", foundOwnerToken, validPngFixture());
+  assert.equal(replacement.status, 200);
+  assert.equal((await replacement.json()).photo.photoId, firstPhoto.photoId);
+
+  await pool.query("INSERT INTO conversations (claim_id, conversation_status) VALUES ($1, 'OPEN') ON CONFLICT (claim_id) DO NOTHING", [claim.claim_id]);
+  const incompleteCapture = await api(`/api/claims/${claim.claim_id}/photo-sharing`, { method: "POST", token: foundOwnerToken });
+  assert.equal(incompleteCapture.status, 409);
+  for (const photoType of ["BACK", "SIDE"]) assert.equal((await uploadPhoto(foundReportId, photoType)).status, 201);
+  const claimantCanShare = await api(`/api/claims/${claim.claim_id}/photo-sharing`, { method: "POST", token });
+  assert.equal(claimantCanShare.status, 403);
+  const shareByStaff = await api(`/api/claims/${claim.claim_id}/photo-sharing`, { method: "POST", token: staffToken });
+  assert.equal(shareByStaff.status, 201);
+  const staffPhotoList = await api(`/api/claims/${claim.claim_id}/photos`, { token: staffToken });
+  assert.equal((await staffPhotoList.json()).photos.length, 3);
+  const staffPhoto = await api(`/api/reports/photos/${firstPhoto.photoId}?claimId=${claim.claim_id}`, { token: staffToken });
+  assert.equal(staffPhoto.status, 200);
+  await pool.query("UPDATE conversations SET conversation_status = 'CLOSED' WHERE claim_id = $1", [claim.claim_id]);
+  const staffAfterClose = await api(`/api/reports/photos/${firstPhoto.photoId}?claimId=${claim.claim_id}`, { token: staffToken });
+  assert.equal(staffAfterClose.status, 403);
+  await pool.query("UPDATE conversations SET conversation_status = 'OPEN' WHERE claim_id = $1", [claim.claim_id]);
+  const revokeByFinder = await api(`/api/claims/${claim.claim_id}/photo-sharing`, { method: "DELETE", token: foundOwnerToken });
+  assert.equal(revokeByFinder.status, 200);
+
+  const adminEmail = `claims-admin-${process.pid}-${Date.now()}@example.test`;
+  const admin = await registerTestUser("Claims Admin Test", adminEmail);
+  extraRoleUsers.push({ id: admin.user.user_id, email: admin.user.email });
+  await pool.query("UPDATE users SET role = 'ADMIN' WHERE user_id = $1", [admin.user.user_id]);
+  const adminToken = jwt.sign({ userId: admin.user.user_id, role: "ADMIN" }, process.env.JWT_SECRET);
+  const shareByAdmin = await api(`/api/claims/${claim.claim_id}/photo-sharing`, { method: "POST", token: adminToken });
+  assert.equal(shareByAdmin.status, 201);
+  const revokeByAdmin = await api(`/api/claims/${claim.claim_id}/photo-sharing`, { method: "DELETE", token: adminToken });
+  assert.equal(revokeByAdmin.status, 200);
 });
 
 test("GET /api/matches includes the persisted match ID and lost-owner eligibility", async () => {
@@ -621,6 +855,7 @@ test("stale matches cannot be claimed even when their stored score qualifies", a
 });
 
 test("review queue and verification endpoints require authentication and reviewer role", async () => {
+  const claimId = (await submitClaim(await createClaimableMatch())).claim_id;
   const noAuth = await api("/api/claims/review-queue");
   assert.equal(noAuth.status, 401);
 
@@ -630,13 +865,13 @@ test("review queue and verification endpoints require authentication and reviewe
   const staffQueue = await api("/api/claims/review-queue", { token: staffToken });
   assert.equal(staffQueue.status, 200);
 
-  const noAuthVerification = await api("/api/claims/1/verifications", {
+  const noAuthVerification = await api(`/api/claims/${claimId}/verifications`, {
     method: "POST",
     body: JSON.stringify({ verificationType: "OWNERSHIP_REVIEW", status: "PASSED" }),
   });
   assert.equal(noAuthVerification.status, 401);
 
-  const userVerification = await api("/api/claims/1/verifications", {
+  const userVerification = await api(`/api/claims/${claimId}/verifications`, {
     method: "POST",
     token,
     body: JSON.stringify({ verificationType: "OWNERSHIP_REVIEW", status: "PASSED" }),
@@ -671,6 +906,13 @@ test("verification starts review and private notes stay out of participant respo
     lost_status: "CLAIM_PENDING",
     found_status: "CLAIM_PENDING",
   });
+  const reviewNotification = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM notifications
+     WHERE user_id = $1 AND notification_type = 'CLAIM_IN_REVIEW'
+       AND reference_type = 'CLAIM' AND reference_id = $2`,
+    [userId, claim.claim_id]
+  );
+  assert.equal(reviewNotification.rows[0].count, 1);
 
   const participantClaims = await api("/api/claims", { token });
   const participantBody = await participantClaims.json();
@@ -742,9 +984,16 @@ test("approval requires a passed verification and rejected claims reopen reports
     body: JSON.stringify({ decision: "REJECTED" }),
   });
   assert.equal(duplicateRejection.status, 409);
+  const rejectionNotification = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM notifications
+     WHERE user_id = $1 AND notification_type = 'CLAIM_REJECTED'
+       AND reference_type = 'CLAIM' AND reference_id = $2`,
+    [userId, claim.claim_id]
+  );
+  assert.equal(rejectionNotification.rows[0].count, 1);
 });
 
-test("verification transaction rolls back when its reviewer cannot be recorded", async () => {
+test("unknown reviewers are rejected before verification changes claim state", async () => {
   const matchId = await createClaimableMatch();
   const claim = await submitClaim(matchId);
   const missingUserToken = jwt.sign(
@@ -761,8 +1010,8 @@ test("verification transaction rolls back when its reviewer cannot be recorded",
       privateNote: "Must rollback with the failed transaction",
     }),
   });
-  assert.equal(response.status, 500);
-  assert.deepEqual(await response.json(), { error: "Unable to record claim verification" });
+  assert.equal(response.status, 403);
+  assert.deepEqual(await response.json(), { error: "You are not authorized to review this claim" });
 
   const state = await pool.query(
     `SELECT c.claim_status, m.match_status, lost.status AS lost_status,
@@ -789,6 +1038,13 @@ test("only the found owner can issue a hashed handover code; claimant confirms i
   const claim = await submitClaim(matchId);
   const approval = await approveClaim(claim.claim_id);
   assert.equal(approval.status, 200, await approval.clone().text());
+  const approvalNotification = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM notifications
+     WHERE user_id = $1 AND notification_type = 'CLAIM_APPROVED'
+       AND reference_type = 'CLAIM' AND reference_id = $2`,
+    [userId, claim.claim_id]
+  );
+  assert.equal(approvalNotification.rows[0].count, 1);
 
   const claimantCannotIssue = await api(`/api/claims/${claim.claim_id}/handover/code`, {
     method: "POST",
@@ -859,6 +1115,17 @@ test("only the found owner can issue a hashed handover code; claimant confirms i
     verified_by_user_id: userId,
   });
   assert.ok(completed.rows[0].code_used_at);
+  const handoverEvents = await pool.query(
+    `SELECT user_id, COUNT(*)::int AS count FROM notifications
+     WHERE notification_type = 'HANDOVER_COMPLETED'
+       AND reference_type = 'CLAIM' AND reference_id = $1
+     GROUP BY user_id ORDER BY user_id`,
+    [claim.claim_id]
+  );
+  assert.deepEqual(handoverEvents.rows.map((row) => `${row.user_id}:${row.count}`).sort(), [
+    `${userId}:1`,
+    `${foundOwnerId}:1`,
+  ].sort());
 });
 
 test("expired handover codes cannot complete and may be replaced", async () => {

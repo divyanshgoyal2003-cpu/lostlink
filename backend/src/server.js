@@ -1,5 +1,6 @@
 
-require("dotenv").config();
+const path = require("node:path");
+require("dotenv").config({ path: path.resolve(__dirname, "../.env") });
 
 const express = require("express");
 const cors = require("cors");
@@ -25,6 +26,9 @@ app.use(
 
 app.use("/api/reports", reportsRouter);
 app.use("/api/claims", claimsRouter);
+app.use("/api/authorities", require("./routes/authorities").router);
+app.use("/api/conversations", require("./routes/conversations"));
+app.use("/api/notifications", require("./routes/notifications"));
 app.use("/api/auth", require("./routes/auth"));
 
 app.get("/", (req, res) => {

@@ -73,6 +73,79 @@ export async function closeReport(token, reportId) {
   })
 }
 
+export async function getAuthorityDestinations(token) {
+  return authenticatedRequest('/authorities/destinations', token)
+}
+
+export async function getAuthorityCapabilities(token) {
+  return authenticatedRequest('/authorities/capabilities', token)
+}
+
+export async function submitAuthorityRequest(token, request) {
+  return authenticatedRequest('/authorities/requests', token, {
+    method: 'POST', body: JSON.stringify(request),
+  })
+}
+
+export async function provisionAuthorityAccount(token, details) {
+  return authenticatedRequest('/authorities/admin/accounts', token, {
+    method: 'POST', body: JSON.stringify(details),
+  })
+}
+
+export async function getClaimConversation(token, claimId) {
+  return authenticatedRequest(`/conversations/claims/${encodeURIComponent(claimId)}`, token)
+}
+
+export async function sendClaimConversationMessage(token, claimId, message) {
+  return authenticatedRequest(`/conversations/claims/${encodeURIComponent(claimId)}`, token, {
+    method: 'POST', body: JSON.stringify({ message }),
+  })
+}
+export async function getAuthorityMemberships(token) {
+  return authenticatedRequest('/authorities/me', token)
+}
+
+export async function getAuthorityAdminQueue(token) {
+  return authenticatedRequest('/authorities/admin/queue', token)
+}
+
+export async function reviewAuthorityDestination(token, authorityId, action) {
+  return authenticatedRequest(`/authorities/admin/destinations/${encodeURIComponent(authorityId)}`, token, {
+    method: 'PATCH', body: JSON.stringify({ action }),
+  })
+}
+
+export async function reviewAuthorityMembership(token, membershipId, action, membershipRole) {
+  return authenticatedRequest(`/authorities/admin/memberships/${encodeURIComponent(membershipId)}`, token, {
+    method: 'PATCH', body: JSON.stringify({ action, membershipRole }),
+  })
+}
+
+export async function getAuthorityCases(token) {
+  return authenticatedRequest('/authorities/cases', token)
+}
+
+export async function assignReportAuthority(token, reportId, recoveryMode, authorityId = null) {
+  return authenticatedRequest(`/authorities/reports/${encodeURIComponent(reportId)}/assignment`, token, {
+    method: 'PATCH', body: JSON.stringify({ recoveryMode, authorityId }),
+  })
+}
+
+export async function initiateCustodyTransfer(token, reportId) {
+  return authenticatedRequest(`/authorities/reports/${encodeURIComponent(reportId)}/custody-transfers`, token, { method: 'POST' })
+}
+
+export async function confirmCustodyTransfer(token, transferId, code) {
+  return authenticatedRequest(`/authorities/custody-transfers/${encodeURIComponent(transferId)}/confirm`, token, {
+    method: 'POST', body: JSON.stringify({ code }),
+  })
+}
+
+export async function cancelCustodyTransfer(token, transferId) {
+  return authenticatedRequest(`/authorities/custody-transfers/${encodeURIComponent(transferId)}/cancel`, token, { method: 'POST' })
+}
+
 
 export async function getMyMatches(token, lostReportId = '') {
   const query = lostReportId
@@ -82,9 +155,11 @@ export async function getMyMatches(token, lostReportId = '') {
 }
 
 export async function refreshMatchCandidates(token) {
-  return authenticatedRequest('/matches/refresh', token, {
+  const result = await authenticatedRequest('/matches/refresh', token, {
     method: 'POST',
   })
+  notifyNotificationsChanged()
+  return result
 }
 
 export async function getMyClaims(token) {
@@ -92,10 +167,37 @@ export async function getMyClaims(token) {
 }
 
 export async function submitClaim(token, matchId) {
-  return authenticatedRequest('/claims', token, {
+  const result = await authenticatedRequest('/claims', token, {
     method: 'POST',
     body: JSON.stringify({ matchId }),
   })
+  notifyNotificationsChanged()
+  return result
+}
+
+function notifyNotificationsChanged() {
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event('lostlink:notifications-refresh'))
+}
+
+export async function getNotifications(token, { limit = 20, offset = 0 } = {}) {
+  const query = new URLSearchParams({ limit: String(limit), offset: String(offset) })
+  return authenticatedRequest(`/notifications?${query}`, token)
+}
+
+export async function getUnreadNotificationCount(token) {
+  return authenticatedRequest('/notifications/unread-count', token)
+}
+
+export async function markNotificationRead(token, notificationId) {
+  const result = await authenticatedRequest(`/notifications/${encodeURIComponent(notificationId)}/read`, token, { method: 'PATCH' })
+  notifyNotificationsChanged()
+  return result
+}
+
+export async function markAllNotificationsRead(token) {
+  const result = await authenticatedRequest('/notifications/read-all', token, { method: 'POST' })
+  notifyNotificationsChanged()
+  return result
 }
 
 export async function getClaimReviewQueue(token) {
@@ -107,17 +209,21 @@ export async function getClaimVerifications(token, claimId) {
 }
 
 export async function submitClaimVerification(token, claimId, verification) {
-  return authenticatedRequest(`/claims/${claimId}/verifications`, token, {
+  const result = await authenticatedRequest(`/claims/${claimId}/verifications`, token, {
     method: 'POST',
     body: JSON.stringify(verification),
   })
+  notifyNotificationsChanged()
+  return result
 }
 
 export async function reviewClaim(token, claimId, decision, privateNote) {
-  return authenticatedRequest(`/claims/${claimId}/review`, token, {
+  const result = await authenticatedRequest(`/claims/${claimId}/review`, token, {
     method: 'PATCH',
     body: JSON.stringify({ decision, privateNote }),
   })
+  notifyNotificationsChanged()
+  return result
 }
 
 export async function issueHandoverCode(token, claimId) {
@@ -127,8 +233,52 @@ export async function issueHandoverCode(token, claimId) {
 }
 
 export async function confirmHandover(token, claimId, code) {
-  return authenticatedRequest(`/claims/${claimId}/handover/confirm`, token, {
+  const result = await authenticatedRequest(`/claims/${claimId}/handover/confirm`, token, {
     method: 'POST',
     body: JSON.stringify({ code }),
   })
+  notifyNotificationsChanged()
+  return result
+}
+
+export async function uploadFoundReportPhoto(token, reportId, photoType, file) {
+  return authenticatedRequest(`/reports/${reportId}/photos`, token, {
+    method: 'PUT',
+    headers: { 'Content-Type': file.type, 'X-Photo-Type': photoType },
+    body: file,
+  })
+}
+
+export async function getFoundReportPhotos(token, reportId) {
+  return authenticatedRequest(`/reports/${reportId}/photos`, token)
+}
+
+export async function getClaimPhotoAccess(token, claimId) {
+  return authenticatedRequest(`/claims/${claimId}/photos`, token)
+}
+
+export async function grantClaimPhotoAccess(token, claimId) {
+  return authenticatedRequest(`/claims/${claimId}/photo-sharing`, token, { method: 'POST' })
+}
+
+export async function revokeClaimPhotoAccess(token, claimId) {
+  return authenticatedRequest(`/claims/${claimId}/photo-sharing`, token, { method: 'DELETE' })
+}
+
+export async function getPrivatePhoto(token, photoId, claimId = null, reportId = null) {
+  const params = new URLSearchParams()
+  if (claimId) params.set('claimId', claimId)
+  if (reportId) params.set('reportId', reportId)
+  const query = params.size ? `?${params.toString()}` : ''
+  const response = await fetch(`${API_BASE_URL}/reports/photos/${encodeURIComponent(photoId)}${query}`, {
+    headers: { Authorization: `Bearer ${token}` },
+    cache: 'no-store',
+  })
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}))
+    const error = new Error(body.error || body.message || `Request failed (${response.status})`)
+    error.status = response.status
+    throw error
+  }
+  return response.blob()
 }

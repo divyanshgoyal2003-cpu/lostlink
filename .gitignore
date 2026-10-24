@@ -5,6 +5,7 @@ node_modules/
 dist/
 coverage/
 uploads/
+/backend/private-photos/
 .DS_Store
 Thumbs.db
 # Logs

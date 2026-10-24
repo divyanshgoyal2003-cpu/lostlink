@@ -1,0 +1,126 @@
+.found-photo-capture {
+  display: grid;
+  gap: 0.75rem;
+  width: 100%;
+  margin-top: 1rem;
+  padding: 1rem;
+  border: 1px solid #dbe6df;
+  border-radius: 12px;
+  background: #f7faf7;
+}
+
+.photo-capture-heading h4,
+.photo-capture-heading p {
+  margin: 0 0 0.35rem;
+}
+
+.photo-capture-heading p,
+.found-photo-capture small {
+  color: #52645d;
+  line-height: 1.5;
+}
+
+.photo-capture-progress,
+.photo-capture-complete {
+  color: #23633c !important;
+  font-weight: 700;
+}
+
+.photo-capture-steps {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 0.75rem;
+}
+
+.photo-capture-step {
+  display: grid;
+  align-content: start;
+  gap: 0.55rem;
+  min-width: 0;
+  padding: 0.75rem;
+  border: 1px solid #dbe6df;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.photo-capture-step img {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: contain;
+  background: #eef2ef;
+}
+
+.photo-upload-button {
+  position: relative;
+  overflow: hidden;
+  text-align: center;
+  cursor: pointer;
+}
+
+.photo-capture-actions,
+.photo-camera-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.photo-capture-actions > button,
+.photo-capture-actions > label {
+  flex: 1 1 auto;
+}
+
+.photo-camera-backdrop {
+  position: fixed;
+  z-index: 1000;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgb(15 25 20 / 72%);
+}
+
+.photo-camera-dialog {
+  display: grid;
+  gap: 0.75rem;
+  width: min(100%, 680px);
+  padding: 1rem;
+  border-radius: 12px;
+  background: #fff;
+}
+
+.photo-camera-dialog h4 {
+  margin: 0;
+}
+
+.photo-camera-dialog video {
+  width: 100%;
+  max-height: 65vh;
+  border-radius: 8px;
+  background: #101510;
+  object-fit: contain;
+}
+
+.photo-upload-button input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.photo-upload-button:focus-within {
+  outline: 3px solid #66a98a;
+  outline-offset: 2px;
+}
+
+.photo-step-saved {
+  color: #23633c;
+  font-size: 0.82rem;
+}
+
+@media (max-width: 520px) {
+  .photo-capture-steps {
+    grid-template-columns: 1fr;
+  }
+}

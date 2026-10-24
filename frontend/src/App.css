@@ -78,6 +78,29 @@ a {
   color: #18835c;
 }
 
+.recovery-choice {
+  grid-column: 1 / -1;
+  padding: 18px;
+  border: 1px solid #dce8e1;
+  border-radius: 12px;
+  background: #f7faf8;
+  display: grid;
+  gap: 10px;
+}
+
+.recovery-choice h4,
+.recovery-choice p { margin: 0; }
+.recovery-choice p { color: #5e6d65; line-height: 1.5; }
+.recovery-choice label { font-weight: 700; }
+.recovery-choice select {
+  min-height: 42px;
+  border: 1px solid #cfddd4;
+  border-radius: 8px;
+  padding: 9px 11px;
+  font: inherit;
+  background: white;
+}
+
 .nav-links,
 .nav-actions {
   display: flex;
@@ -1498,4 +1521,13 @@ a {
   .location-search-row button {
     width: 100%;
   }
+}
+/* Authority and administrator accounts use an operations-only workspace. */
+.operations-mode > .hero-section,
+.operations-mode > #report,
+.operations-mode > #how-it-works,
+.operations-mode > #my-reports,
+.operations-mode > #my-matches,
+.operations-mode > .safety-banner {
+  display: none;
 }

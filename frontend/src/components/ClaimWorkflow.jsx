@@ -7,8 +7,11 @@ import {
   issueHandoverCode,
   reviewClaim,
   submitClaimVerification,
+  getAuthorityMemberships,
 } from '../api'
 import './ClaimWorkflow.css'
+import ClaimPhotoAccess from './ClaimPhotoAccess'
+import ConversationPanel from './ConversationPanel'
 
 const REVIEW_ROLES = ['STAFF', 'ADMIN']
 
@@ -33,10 +36,13 @@ function readableError(error) {
 }
 
 function statusDescription(status, relationship) {
-  if (status === 'SUBMITTED') return 'Waiting for staff review.'
+  if (status === 'SUBMITTED') return 'Waiting for the assigned review team.'
   if (status === 'IN_REVIEW') return 'A reviewer is checking the claim.'
   if (status === 'APPROVED' && relationship === 'FOUND_REPORT_OWNER') {
-    return 'Issue a one-time code when you are ready to hand over the item.'
+    return 'The assigned authority manages claimant release after receiving the item.'
+  }
+  if (status === 'APPROVED' && relationship === 'AUTHORITY_CLAIMANT') {
+    return 'Enter the one-time release code provided by the assigned authority.'
   }
   if (status === 'APPROVED') return 'Enter the code provided by the found-item owner to confirm handover.'
   if (status === 'REJECTED') return 'This claim was rejected. Contact support if you need help.'
@@ -49,8 +55,9 @@ function updateById(setter, id, value) {
   setter((previous) => ({ ...previous, [id]: value }))
 }
 
-function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh }) {
-  const isReviewer = REVIEW_ROLES.includes(user?.role)
+function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hidePersonalClaims = false }) {
+  const [hasAuthorityMembership, setHasAuthorityMembership] = useState(false)
+  const isReviewer = REVIEW_ROLES.includes(user?.role) || hasAuthorityMembership
   const [claimsLoading, setClaimsLoading] = useState(false)
   const [claimsError, setClaimsError] = useState('')
   const [reviewQueue, setReviewQueue] = useState([])
@@ -65,6 +72,26 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh }) 
   const [historyLoading, setHistoryLoading] = useState('')
   const [issuedCodes, setIssuedCodes] = useState({})
   const [codeInputs, setCodeInputs] = useState({})
+  const [reviewOptions, setReviewOptions] = useState({})
+
+  useEffect(() => {
+    let active = true
+    if (!token) {
+      setHasAuthorityMembership(false)
+      return () => { active = false }
+    }
+    getAuthorityMemberships(token)
+      .then((result) => {
+        if (!active) return
+        setHasAuthorityMembership((result.memberships || []).some((membership) =>
+          membership.membership_status === 'ACTIVE' &&
+          membership.verification_status === 'VERIFIED' &&
+          membership.destination_status === 'ACTIVE',
+        ))
+      })
+      .catch(() => { if (active) setHasAuthorityMembership(false) })
+    return () => { active = false }
+  }, [token])
 
   async function loadClaims() {
     if (!token) {
@@ -118,9 +145,9 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh }) 
       loadClaims()
       if (isReviewer) loadReviewQueue()
     }
-    // Load only when the signed-in identity or role changes.
+    // Load only when the signed-in identity, role, or active authority access changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, user?.role])
+  }, [token, user?.role, isReviewer])
 
   async function runAction(key, action, successMessage) {
     setPendingAction(key)
@@ -141,7 +168,7 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh }) 
   async function handleVerification(claim) {
     const id = claim.claim_id
     const draft = verificationDrafts[id] || {
-      verificationType: 'OWNERSHIP_REVIEW',
+      verificationType: 'OWNERSHIP_VERIFICATION',
       status: 'NEEDS_REVIEW',
       privateNote: '',
     }
@@ -199,7 +226,7 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh }) 
 
   return (
     <>
-      <section className="my-reports-section claim-workflow" id="my-claims" aria-labelledby="my-claims-title">
+      <section className="my-reports-section claim-workflow" id="my-claims" aria-labelledby="my-claims-title" hidden={hidePersonalClaims}>
         <div className="section-heading">
           <span className="section-kicker">YOUR ACTIVITY</span>
           <h2 id="my-claims-title">My claims</h2>
@@ -239,9 +266,13 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh }) 
                   <p><strong>Match:</strong> #{claim.match_id} · score {Math.round(Number(claim.total_score))}/100</p>
                   <p><strong>Your role:</strong> {relationship === 'CLAIMANT' ? 'Claimant' : 'Found-item owner'}</p>
                   <p><strong>Submitted:</strong> {new Date(claim.submitted_at).toLocaleString()}</p>
-                  <p className="claim-next-step">{statusDescription(claim.claim_status, relationship)}</p>
+                  <p className="claim-next-step">{claim.authority_custody_received && relationship === 'FOUND_REPORT_OWNER'
+                    ? 'The assigned authority has physical custody and manages claimant release.'
+                    : statusDescription(claim.claim_status, relationship === 'CLAIMANT' && claim.authority_custody_received ? 'AUTHORITY_CLAIMANT' : relationship)}</p>
+                  <ClaimPhotoAccess token={token} claimId={id} onRefresh={onRefresh} />
+                  {claim.conversation_status === 'OPEN' && <ConversationPanel token={token} claimId={id} title={claim.found_recovery_mode === 'AUTHORITY' ? 'Chat with the assigned authority' : 'Chat with the found-item owner'} />}
 
-                  {claim.claim_status === 'APPROVED' && relationship === 'FOUND_REPORT_OWNER' && (
+                  {claim.claim_status === 'APPROVED' && relationship === 'FOUND_REPORT_OWNER' && !claim.authority_custody_received && (
                     <div className="claim-handover-box">
                       <p>Request a fresh code only when you are ready to hand over the item. The code is single-use and expires in 15 minutes.</p>
                       {issuedCodes[id] ? (
@@ -309,7 +340,7 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh }) 
           <div className="section-heading">
             <span className="section-kicker">STAFF WORKSPACE</span>
             <h2 id="claim-review-title">Claim review queue</h2>
-            <p>Record a verification before approving. Private notes are visible only to staff and admins.</p>
+            <p>Record a verification before approving. Private notes are visible only to authorized reviewers.</p>
           </div>
 
           {queueLoading ? (
@@ -326,7 +357,7 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh }) 
               {reviewQueue.map((claim) => {
                 const id = claim.claim_id
                 const verification = verificationDrafts[id] || {
-                  verificationType: 'OWNERSHIP_REVIEW',
+                  verificationType: 'OWNERSHIP_VERIFICATION',
                   status: 'NEEDS_REVIEW',
                   privateNote: '',
                 }
@@ -340,97 +371,132 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh }) 
                         {STATUS_LABELS[claim.claim_status] || claim.claim_status}
                       </span>
                     </div>
-                    <p><strong>Claimant:</strong> user #{claim.claimant_user_id}</p>
-                    <p><strong>Match:</strong> #{claim.match_id} · score {Math.round(Number(claim.total_score))}/100</p>
-                    <p><strong>Reports:</strong> lost #{claim.lost_report_id}, found #{claim.found_report_id}</p>
-                    <p><strong>Latest verification:</strong> {claim.latest_verification_status || 'None recorded'}</p>
+                    <div className="claim-review-summary">
+                      <div><strong>Claimant</strong><span>{claim.claimant_name || `User #${claim.claimant_user_id}`} · user #{claim.claimant_user_id}</span></div>
+                      <div><strong>Match</strong><span>#{claim.match_id} · {Math.round(Number(claim.total_score))}/100</span></div>
+                      <div><strong>Latest verification</strong><span>{claim.latest_verification_status || 'None recorded'}</span></div>
+                      {claim.found_authority_name && <div><strong>Assigned authority</strong><span>{claim.found_authority_name}</span></div>}
+                    </div>
+                    <div className="claim-review-reports">
+                      <section className="claim-review-report-details">
+                        <h3>Lost report</h3>
+                        <h4>{claim.lost_item_title || `Report #${claim.lost_report_id}`}</h4>
+                        <p>{claim.lost_item_category?.replaceAll('_', ' ')}{claim.lost_report_time ? ` · ${new Date(claim.lost_report_time).toLocaleDateString()}` : ''}</p>
+                        {claim.lost_item_color && <p>Color: {claim.lost_item_color}</p>}
+                        {claim.lost_item_company && <p>Brand: {claim.lost_item_company}</p>}
+                        {claim.lost_item_model && <p>Model: {claim.lost_item_model}</p>}
+                        {claim.lost_item_description && <p>{claim.lost_item_description}</p>}
+                        {claim.lost_location_description && <p>Location details: {claim.lost_location_description}</p>}
+                      </section>
+                      <section className="claim-review-report-details">
+                        <h3>Found report</h3>
+                        <h4>{claim.found_item_title || `Report #${claim.found_report_id}`}</h4>
+                        <p>{claim.found_item_category?.replaceAll('_', ' ')}{claim.found_report_time ? ` · ${new Date(claim.found_report_time).toLocaleDateString()}` : ''}</p>
+                        {claim.found_item_color && <p>Color: {claim.found_item_color}</p>}
+                        {claim.found_item_company && <p>Brand: {claim.found_item_company}</p>}
+                        {claim.found_item_model && <p>Model: {claim.found_item_model}</p>}
+                        {claim.found_item_description && <p>{claim.found_item_description}</p>}
+                        {claim.found_location_description && <p>Location details: {claim.found_location_description}</p>}
+                      </section>
+                    </div>
 
                     <button
                       type="button"
-                      className="btn btn-secondary"
-                      disabled={historyLoading === id}
-                      onClick={() => handleHistory(id)}
+                      className="btn btn-primary claim-enable-chat"
+                      aria-expanded={Boolean(reviewOptions[id])}
+                      aria-controls={`claim-review-options-${id}`}
+                      onClick={() => updateById(setReviewOptions, id, !reviewOptions[id])}
                     >
-                      {historyLoading === id ? 'Loading history…' : history[id] ? 'Refresh private review history' : 'Load private review history'}
+                      {reviewOptions[id] ? 'Hide chat and review options' : 'Enable chat'}
                     </button>
-                    {history[id] && (
-                      <div className="claim-history">
-                        {history[id].length === 0 ? <p>No verification records yet.</p> : history[id].map((entry) => (
-                          <div className="claim-history-entry" key={entry.verification_id}>
-                            <strong>{entry.verification_type}: {entry.verification_status}</strong>
-                            {entry.review_notes_private && <p>{entry.review_notes_private}</p>}
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                    {actionErrors[`history-${id}`] && <p className="auth-error" role="alert">{actionErrors[`history-${id}`]}</p>}
-
-                    <div className="claim-review-form">
-                      <label htmlFor={`verification-type-${id}`}>Verification type</label>
-                      <input
-                        id={`verification-type-${id}`}
-                        value={verification.verificationType}
-                        maxLength={40}
-                        onChange={(event) => updateById(setVerificationDrafts, id, { ...verification, verificationType: event.target.value.toUpperCase().replace(/[^A-Z0-9_]/g, '').slice(0, 40) })}
-                      />
-                      <label htmlFor={`verification-status-${id}`}>Verification result</label>
-                      <select
-                        id={`verification-status-${id}`}
-                        value={verification.status}
-                        onChange={(event) => updateById(setVerificationDrafts, id, { ...verification, status: event.target.value })}
-                      >
-                        <option value="NEEDS_REVIEW">Needs more review</option>
-                        <option value="PASSED">Passed</option>
-                        <option value="FAILED">Failed</option>
-                      </select>
-                      <label htmlFor={`verification-note-${id}`}>Private reviewer note</label>
-                      <textarea
-                        id={`verification-note-${id}`}
-                        maxLength={2000}
-                        rows={3}
-                        value={verification.privateNote}
-                        onChange={(event) => updateById(setVerificationDrafts, id, { ...verification, privateNote: event.target.value })}
-                      />
+                    <div id={`claim-review-options-${id}`} hidden={!reviewOptions[id]}>
+                    {reviewOptions[id] && <>
+                      {claim.conversation_status === 'OPEN'
+                        ? <ConversationPanel token={token} claimId={id} title={claim.found_recovery_mode === 'AUTHORITY' ? 'Chat with the assigned authority' : 'Chat with the found-item owner'} />
+                        : <p className="claim-chat-note">Chat is not active for this claim yet. You can continue with verification and review below.</p>}
                       <button
                         type="button"
                         className="btn btn-secondary"
-                        disabled={pendingAction === actionKey || !verification.verificationType}
-                        onClick={() => handleVerification(claim)}
+                        disabled={historyLoading === id}
+                        onClick={() => handleHistory(id)}
                       >
-                        {pendingAction === actionKey ? 'Saving verification…' : 'Record verification'}
+                        {historyLoading === id ? 'Loading history…' : history[id] ? 'Refresh private review history' : 'Load private review history'}
                       </button>
-                      {feedback[actionKey] && <p className="claim-feedback" role="status">{feedback[actionKey]}</p>}
-                      {actionErrors[actionKey] && <p className="auth-error" role="alert">{actionErrors[actionKey]}</p>}
+                      {history[id] && (
+                        <div className="claim-history">
+                          {history[id].length === 0 ? <p>No verification records yet.</p> : history[id].map((entry) => (
+                            <div className="claim-history-entry" key={entry.verification_id}>
+                              <strong>{entry.verification_type}: {entry.verification_status}</strong>
+                              {entry.review_notes_private && <p>{entry.review_notes_private}</p>}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {actionErrors[`history-${id}`] && <p className="auth-error" role="alert">{actionErrors[`history-${id}`]}</p>}
 
-                      <label htmlFor={`decision-note-${id}`}>Private decision note (optional)</label>
-                      <textarea
-                        id={`decision-note-${id}`}
-                        maxLength={2000}
-                        rows={2}
-                        value={decisionNotes[id] || ''}
-                        onChange={(event) => updateById(setDecisionNotes, id, event.target.value)}
-                      />
-                      <div className="claim-review-actions">
-                        <button
-                          type="button"
-                          className="btn btn-primary"
-                          disabled={!canApprove || pendingAction === `decision-${id}`}
-                          onClick={() => handleDecision(claim, 'APPROVED')}
+                      <div className="claim-review-form">
+                        <label htmlFor={`verification-type-${id}`}>Verification type</label>
+                        <input id={`verification-type-${id}`} value="OWNERSHIP_VERIFICATION" readOnly aria-readonly="true" />
+                        <label htmlFor={`verification-status-${id}`}>Verification result</label>
+                        <select
+                          id={`verification-status-${id}`}
+                          value={verification.status}
+                          onChange={(event) => updateById(setVerificationDrafts, id, { ...verification, status: event.target.value })}
                         >
-                          Approve claim
-                        </button>
+                          <option value="NEEDS_REVIEW">Needs more review</option>
+                          <option value="PASSED">Passed</option>
+                          <option value="FAILED">Failed</option>
+                        </select>
+                        <label htmlFor={`verification-note-${id}`}>Private reviewer note</label>
+                        <textarea
+                          id={`verification-note-${id}`}
+                          maxLength={2000}
+                          rows={3}
+                          value={verification.privateNote}
+                          onChange={(event) => updateById(setVerificationDrafts, id, { ...verification, privateNote: event.target.value })}
+                        />
                         <button
                           type="button"
                           className="btn btn-secondary"
-                          disabled={claim.claim_status !== 'IN_REVIEW' || pendingAction === `decision-${id}`}
-                          onClick={() => handleDecision(claim, 'REJECTED')}
+                          disabled={pendingAction === actionKey}
+                          onClick={() => handleVerification(claim)}
                         >
-                          Reject claim
+                          {pendingAction === actionKey ? 'Saving verification…' : 'Record verification'}
                         </button>
+                        {feedback[actionKey] && <p className="claim-feedback" role="status">{feedback[actionKey]}</p>}
+                        {actionErrors[actionKey] && <p className="auth-error" role="alert">{actionErrors[actionKey]}</p>}
+
+                        <label htmlFor={`decision-note-${id}`}>Private decision note (optional)</label>
+                        <textarea
+                          id={`decision-note-${id}`}
+                          maxLength={2000}
+                          rows={2}
+                          value={decisionNotes[id] || ''}
+                          onChange={(event) => updateById(setDecisionNotes, id, { ...decisionNotes, [id]: event.target.value })}
+                        />
+                        <div className="claim-review-actions">
+                          <button
+                            type="button"
+                            className="btn btn-primary"
+                            disabled={!canApprove || pendingAction === `decision-${id}`}
+                            onClick={() => handleDecision(claim, 'APPROVED')}
+                          >
+                            Approve claim
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-secondary"
+                            disabled={claim.claim_status !== 'IN_REVIEW' || pendingAction === `decision-${id}`}
+                            onClick={() => handleDecision(claim, 'REJECTED')}
+                          >
+                            Reject claim
+                          </button>
+                        </div>
+                        {!canApprove && <small>Approval is available after the latest verification is marked Passed.</small>}
+                        {feedback[`decision-${id}`] && <p className="claim-feedback" role="status">{feedback[`decision-${id}`]}</p>}
+                        {actionErrors[`decision-${id}`] && <p className="auth-error" role="alert">{actionErrors[`decision-${id}`]}</p>}
                       </div>
-                      {!canApprove && <small>Approval is available after the latest verification is marked Passed.</small>}
-                      {feedback[`decision-${id}`] && <p className="claim-feedback" role="status">{feedback[`decision-${id}`]}</p>}
-                      {actionErrors[`decision-${id}`] && <p className="auth-error" role="alert">{actionErrors[`decision-${id}`]}</p>}
+                    </>}
                     </div>
                   </article>
                 )

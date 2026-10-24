@@ -1,9 +1,338 @@
 
 const express = require("express");
+const crypto = require("node:crypto");
+const fs = require("node:fs/promises");
+const path = require("node:path");
 const pool = require("../config/db");
 const authenticateToken = require("../middleware/auth");
+const { createNotification } = require("../notifications");
+const { currentUser, hasActiveAuthorityMembership } = require("../authorityAccess");
 
 const router = express.Router();
+const PRIVATE_PHOTO_DIR = path.resolve(
+  process.env.PRIVATE_PHOTO_DIR || path.join(__dirname, "../../private-photos")
+);
+const PHOTO_MAX_BYTES = 8 * 1024 * 1024;
+const PHOTO_TYPES = new Set(["FRONT", "BACK", "SIDE", "DISTINGUISHING_DETAIL"]);
+
+function pngCrc32(bytes) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function isPng(bytes) {
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  if (bytes.length < 57 || !bytes.subarray(0, 8).equals(signature)) return false;
+  let offset = 8;
+  let first = true;
+  let hasData = false;
+  let ended = false;
+  while (offset + 12 <= bytes.length) {
+    const length = bytes.readUInt32BE(offset);
+    const end = offset + 12 + length;
+    if (end > bytes.length) return false;
+    const type = bytes.toString("ascii", offset + 4, offset + 8);
+    const crc = pngCrc32(bytes.subarray(offset + 4, offset + 8 + length));
+    if (bytes.readUInt32BE(offset + 8 + length) !== crc) return false;
+    if (first) {
+      if (type !== "IHDR" || length !== 13) return false;
+      const width = bytes.readUInt32BE(offset + 8);
+      const height = bytes.readUInt32BE(offset + 12);
+      if (!width || !height || width > 12000 || height > 12000) return false;
+      first = false;
+    }
+    if (type === "IDAT") hasData = true;
+    if (type === "IEND") {
+      if (length !== 0 || end !== bytes.length) return false;
+      ended = true;
+      break;
+    }
+    offset = end;
+  }
+  return !first && hasData && ended;
+}
+
+function isJpeg(bytes) {
+  if (bytes.length < 12 || bytes[0] !== 0xff || bytes[1] !== 0xd8 || bytes.at(-2) !== 0xff || bytes.at(-1) !== 0xd9) return false;
+  let offset = 2;
+  let hasFrame = false;
+  let hasScan = false;
+  while (offset < bytes.length - 2) {
+    if (bytes[offset] !== 0xff) return false;
+    while (bytes[offset] === 0xff) offset += 1;
+    const marker = bytes[offset++];
+    if (marker === 0xd9) break;
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd8)) continue;
+    if (offset + 2 > bytes.length) return false;
+    const length = bytes.readUInt16BE(offset);
+    if (length < 2 || offset + length > bytes.length) return false;
+    if ((marker >= 0xc0 && marker <= 0xcf) && ![0xc4, 0xc8, 0xcc].includes(marker)) {
+      if (length < 8 || bytes.readUInt16BE(offset + 3) === 0 || bytes.readUInt16BE(offset + 5) === 0) return false;
+      hasFrame = true;
+    }
+    if (marker === 0xda) {
+      if (offset + length >= bytes.length - 2) return false;
+      hasScan = true;
+      break;
+    }
+    offset += length;
+  }
+  return hasFrame && hasScan;
+}
+
+function isWebp(bytes) {
+  if (bytes.length < 30 || bytes.toString("ascii", 0, 4) !== "RIFF" || bytes.toString("ascii", 8, 12) !== "WEBP" || bytes.readUInt32LE(4) + 8 !== bytes.length) return false;
+  let offset = 12;
+  let hasImageChunk = false;
+  while (offset + 8 <= bytes.length) {
+    const type = bytes.toString("ascii", offset, offset + 4);
+    const size = bytes.readUInt32LE(offset + 4);
+    if (offset + 8 + size > bytes.length) return false;
+    if (
+      (type === "VP8 " && size >= 10 && bytes.subarray(offset + 11, offset + 14).equals(Buffer.from([0x9d, 0x01, 0x2a]))) ||
+      (type === "VP8L" && size >= 5 && bytes[offset + 8] === 0x2f)
+    ) hasImageChunk = true;
+    offset += 8 + size + (size & 1);
+  }
+  return hasImageChunk && offset === bytes.length;
+}
+
+const PHOTO_FORMATS = {
+  "image/jpeg": { extension: ".jpg", matches: isJpeg },
+  "image/png": { extension: ".png", matches: isPng },
+  "image/webp": { extension: ".webp", matches: isWebp },
+};
+
+function safePhotoId(value) {
+  return typeof value === "string" && /^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value));
+}
+
+function photoMetadata(row) {
+  return { photoId: String(row.photo_id), photoType: row.photo_type, uploadedAt: row.uploaded_at };
+}
+
+async function removePrivatePhoto(storageKey) {
+  if (typeof storageKey !== "string" || !/^[a-f0-9-]+\.(jpg|png|webp)$/.test(storageKey)) return;
+  try {
+    await fs.unlink(path.join(PRIVATE_PHOTO_DIR, storageKey));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+}
+
+function validatePhoto(contentType, bytes) {
+  const format = PHOTO_FORMATS[contentType];
+  if (!format || !Buffer.isBuffer(bytes) || bytes.length === 0 || bytes.length > PHOTO_MAX_BYTES || !format.matches(bytes)) {
+    return null;
+  }
+  return format;
+}
+
+function parsePrivatePhotoBody(req, res, next) {
+  express.raw({ type: ["image/jpeg", "image/png", "image/webp"], limit: PHOTO_MAX_BYTES })(req, res, (error) => {
+    if (!error) return next();
+    if (error.type === "entity.too.large") return res.status(413).json({ error: "Photo must be 8 MB or smaller" });
+    return res.status(400).json({ error: "Unable to read image upload" });
+  });
+}
+
+// Photo bytes are accepted as a raw image body, never as a public/object URL.
+router.put(
+  "/:id/photos",
+  authenticateToken,
+  parsePrivatePhotoBody,
+  async (req, res) => {
+    const reportId = req.params.id;
+    const photoType = req.get("X-Photo-Type");
+    if (!/^[1-9]\d*$/.test(reportId) || !Number.isSafeInteger(Number(reportId))) {
+      return res.status(400).json({ error: "Invalid report ID" });
+    }
+    if (!PHOTO_TYPES.has(photoType)) {
+      return res.status(400).json({ error: "Photo type must be FRONT, BACK, SIDE, or DISTINGUISHING_DETAIL" });
+    }
+    const format = validatePhoto(req.get("Content-Type")?.split(";")[0], req.body);
+    if (!format) {
+      return res.status(415).json({ error: "Upload a valid JPEG, PNG, or WebP image under 8 MB" });
+    }
+
+    const storageKey = `${crypto.randomUUID()}${format.extension}`;
+    let client;
+    let savedFile = false;
+    try {
+      client = await pool.connect();
+      await client.query("BEGIN");
+      const report = await client.query(
+        `SELECT r.item_id
+         FROM reports r JOIN items i ON i.item_id = r.item_id
+         WHERE r.report_id = $1 AND r.user_id = $2
+           AND r.report_type = 'FOUND' AND r.status = 'OPEN'
+         FOR UPDATE OF r, i`,
+        [reportId, req.user.userId]
+      );
+      if (!report.rowCount) {
+        await client.query("ROLLBACK");
+        await removePrivatePhoto(storageKey);
+        return res.status(404).json({ error: "Open found report not found" });
+      }
+
+      await fs.mkdir(PRIVATE_PHOTO_DIR, { recursive: true });
+      await fs.writeFile(path.join(PRIVATE_PHOTO_DIR, storageKey), req.body, { flag: "wx", mode: 0o600 });
+      savedFile = true;
+
+      const itemId = report.rows[0].item_id;
+      const existing = await client.query(
+        `SELECT photo_id, storage_key FROM item_photos
+         WHERE item_id = $1 AND photo_type = $2
+         ORDER BY uploaded_at DESC, photo_id DESC LIMIT 1 FOR UPDATE`,
+        [itemId, photoType]
+      );
+      let result;
+      if (existing.rowCount) {
+        result = await client.query(
+          `UPDATE item_photos SET storage_key = $2, uploaded_at = NOW()
+           WHERE photo_id = $1 RETURNING photo_id, photo_type, uploaded_at`,
+          [existing.rows[0].photo_id, storageKey]
+        );
+      } else {
+        result = await client.query(
+          `INSERT INTO item_photos (item_id, storage_key, photo_type)
+           VALUES ($1, $2, $3) RETURNING photo_id, photo_type, uploaded_at`,
+          [itemId, storageKey, photoType]
+        );
+      }
+      await client.query("COMMIT");
+      savedFile = false;
+      if (existing.rowCount) await removePrivatePhoto(existing.rows[0].storage_key);
+      return res.status(existing.rowCount ? 200 : 201).json({ photo: photoMetadata(result.rows[0]) });
+    } catch (error) {
+      if (client) {
+        try { await client.query("ROLLBACK"); } catch { /* keep the original error */ }
+      }
+      if (savedFile) {
+        try { await removePrivatePhoto(storageKey); } catch { /* orphan cleanup can be retried */ }
+      }
+      console.error("Upload found report photo failed:", error.message);
+      return res.status(500).json({ error: "Unable to save report photo" });
+    } finally {
+      if (client) client.release();
+    }
+  }
+);
+
+// Finder-only metadata listing; storage keys never leave the server.
+router.get("/:id/photos", authenticateToken, async (req, res) => {
+  const reportId = req.params.id;
+  if (!/^[1-9]\d*$/.test(reportId) || !Number.isSafeInteger(Number(reportId))) {
+    return res.status(400).json({ error: "Invalid report ID" });
+  }
+  try {
+    const result = await pool.query(
+      `SELECT p.photo_id, p.photo_type, p.uploaded_at
+       FROM reports r JOIN item_photos p ON p.item_id = r.item_id
+       WHERE r.report_id = $1 AND r.user_id = $2 AND r.report_type = 'FOUND'
+       ORDER BY p.photo_type, p.photo_id`,
+      [reportId, req.user.userId]
+    );
+    if (!result.rowCount) {
+      const owned = await pool.query(
+        `SELECT 1 FROM reports WHERE report_id = $1 AND user_id = $2 AND report_type = 'FOUND'`,
+        [reportId, req.user.userId]
+      );
+      if (!owned.rowCount) return res.status(404).json({ error: "Found report not found" });
+    }
+    return res.json({ photos: result.rows.map(photoMetadata) });
+  } catch (error) {
+    console.error("List found report photos failed:", error.message);
+    return res.status(500).json({ error: "Unable to list report photos" });
+  }
+});
+
+// Authenticated binary retrieval. A claimant must present the specific claim ID.
+router.get("/photos/:photoId", authenticateToken, async (req, res) => {
+  if (!safePhotoId(req.params.photoId)) return res.status(400).json({ error: "Invalid photo ID" });
+  const claimId = req.query.claimId;
+  const requestedReportId = req.query.reportId;
+  if (claimId == null && !safePhotoId(String(requestedReportId || ""))) {
+    return res.status(400).json({ error: "A reportId or claimId is required" });
+  }
+  try {
+    const result = await pool.query(
+      `SELECT p.photo_id, p.storage_key, r.report_id AS found_report_id, r.user_id AS finder_id,
+              r.authority_id
+       FROM item_photos p
+       JOIN reports r ON r.item_id = p.item_id AND r.report_type = 'FOUND'
+         AND ($2::bigint IS NULL OR r.report_id = $2)
+       WHERE p.photo_id = $1
+       ORDER BY r.report_id`,
+      [req.params.photoId, requestedReportId || null]
+    );
+    if (!result.rowCount) return res.status(404).json({ error: "Photo not found" });
+    let selected = null;
+    for (const photo of result.rows) {
+      if (claimId == null && Number(photo.finder_id) === req.user.userId) {
+        selected = photo;
+        break;
+      }
+      // Verified physical custody grants the assigned active authority access
+      // to these private report photos without a claimant sharing grant.
+      if (claimId == null && requestedReportId && photo.authority_id &&
+          await hasActiveAuthorityMembership(pool, req.user.userId, photo.authority_id,
+            { requireCustody: true, reportId: photo.found_report_id })) {
+        selected = photo;
+        break;
+      }
+      if (!safePhotoId(String(claimId || ""))) continue;
+      const access = await pool.query(
+        `SELECT c.claimant_user_id, conv.conversation_status, f.authority_id,
+                EXISTS (SELECT 1 FROM claim_photo_shares s
+                        WHERE s.claim_id = c.claim_id AND s.revoked_at IS NULL) AS shared
+         FROM claim_requests c
+         JOIN match_records m ON m.match_id = c.match_id
+         JOIN reports f ON f.report_id = m.found_report_id
+         LEFT JOIN conversations conv ON conv.claim_id = c.claim_id
+         WHERE c.claim_id = $1 AND m.found_report_id = $2`,
+        [claimId, photo.found_report_id]
+      );
+      if (!access.rowCount) continue;
+      const row = access.rows[0];
+      const finderAllowed = Number(photo.finder_id) === req.user.userId;
+      const claimantAllowed = Number(row.claimant_user_id) === req.user.userId && row.shared;
+      const current = await currentUser(pool, req.user.userId);
+      const staffAllowed = current?.account_status === "ACTIVE" &&
+        (current.role === "ADMIN" || (current.role === "STAFF" && !row.authority_id)) &&
+        row.conversation_status === "OPEN";
+      const authorityAllowed = row.shared && row.conversation_status === "OPEN" &&
+        await hasActiveAuthorityMembership(pool, req.user.userId, row.authority_id, { requireCustody: true, reportId: photo.found_report_id });
+      if (finderAllowed || claimantAllowed || staffAllowed || authorityAllowed) {
+        selected = photo;
+        break;
+      }
+    }
+    if (!selected) return res.status(403).json({ error: "You are not authorized to view this photo" });
+
+    const resolved = path.resolve(PRIVATE_PHOTO_DIR, selected.storage_key);
+    if (path.dirname(resolved) !== PRIVATE_PHOTO_DIR) return res.status(404).json({ error: "Photo not found" });
+    const bytes = await fs.readFile(resolved);
+    const extension = path.extname(selected.storage_key);
+    const contentType = extension === ".jpg" ? "image/jpeg" : extension === ".png" ? "image/png" : "image/webp";
+    res.set({
+      "Content-Type": contentType,
+      "Content-Length": String(bytes.length),
+      "Content-Disposition": "inline",
+      "X-Content-Type-Options": "nosniff",
+      "Cache-Control": "private, no-store",
+    });
+    return res.send(bytes);
+  } catch (error) {
+    if (error.code === "ENOENT") return res.status(404).json({ error: "Photo not found" });
+    console.error("Retrieve private photo failed:", error.message);
+    return res.status(500).json({ error: "Unable to retrieve photo" });
+  }
+});
 
 const VALID_CATEGORIES = [
   "ELECTRONICS",
@@ -42,6 +371,8 @@ router.post("/", authenticateToken, async (req, res) => {
   attributes = {},
     reportType,
     reportTime,
+    recoveryMode = "DIRECT",
+    authorityId = null,
     latitude,
     longitude,
     uncertaintyRadiusM = 75,
@@ -81,6 +412,15 @@ router.post("/", authenticateToken, async (req, res) => {
     return res.status(400).json({
       error: "locationSource must be GPS or MAP_PIN",
     });
+  }
+
+  if (!['DIRECT', 'AUTHORITY'].includes(recoveryMode) ||
+      recoveryMode === 'AUTHORITY' && !/^[1-9]\d*$/.test(String(authorityId || '')) ||
+      recoveryMode === 'DIRECT' && authorityId != null && authorityId !== '') {
+    return res.status(400).json({ error: "Choose direct recovery or a valid authority destination" });
+  }
+  if (reportType === 'LOST' && recoveryMode !== 'DIRECT') {
+    return res.status(400).json({ error: "Only found reports can be assigned to an authority" });
   }
 
   if (
@@ -213,6 +553,19 @@ if (
       });
     }
 
+    if (recoveryMode === 'AUTHORITY') {
+      const eligibleDestination = await client.query(
+        `SELECT authority_id FROM authority_destinations
+         WHERE authority_id = $1 AND verification_status = 'VERIFIED'
+           AND destination_status = 'ACTIVE' FOR SHARE`,
+        [authorityId]
+      );
+      if (!eligibleDestination.rowCount) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "Select a verified, active authority destination" });
+      }
+    }
+
     const itemResult = await client.query(
       `INSERT INTO items
         (category, title, description, color, attributes_json)
@@ -242,15 +595,18 @@ if (
         uncertainty_radius_m,
         location_accuracy_m,
         location_source,
-        location_description
+        location_description,
+        recovery_mode,
+        authority_id
       )
       VALUES (
         $1, $2, $3, $4,
         ST_SetSRID(ST_MakePoint($5, $6), 4326)::geography,
-        $7, $8, $9, $10
+        $7, $8, $9, $10, $11, $12
       )
       RETURNING
         report_id, report_type, report_time, status,
+        recovery_mode, authority_id,
         uncertainty_radius_m, location_accuracy_m,
         location_source, location_description, created_at`,
       [
@@ -264,8 +620,25 @@ if (
         locationAccuracyM == null ? null : Number(locationAccuracyM),
         locationSource,
         locationDescription,
+        recoveryMode,
+        recoveryMode === 'AUTHORITY' ? authorityId : null,
       ]
     );
+
+    if (recoveryMode === 'AUTHORITY') {
+      await client.query(
+        `INSERT INTO audit_logs (actor_user_id, action_type, entity_type, entity_id, metadata)
+         VALUES ($1, 'AUTHORITY_REPORT_ASSIGNED', 'REPORT', $2, $3::jsonb)`,
+        [userId, reportResult.rows[0].report_id, JSON.stringify({ recoveryMode, authorityId: Number(authorityId), initialAssignment: true })]
+      );
+      const authorityMembers = await client.query(
+        `SELECT user_id FROM authority_memberships WHERE authority_id=$1 AND membership_status='ACTIVE'`,
+        [authorityId]
+      );
+      for (const member of authorityMembers.rows) {
+        await createNotification(client, member.user_id, "AUTHORITY_CASE_ASSIGNED", "REPORT", reportResult.rows[0].report_id);
+      }
+    }
 
     await client.query("COMMIT");
 
@@ -283,8 +656,8 @@ if (
 
     console.error("Create report failed:", error.message);
 
-    return res.status(500).json({
-      error: "Unable to create report",
+    return res.status(error.code === "23514" ? 400 : 500).json({
+      error: error.code === "23514" ? "Authority destination is no longer eligible" : "Unable to create report",
     });
   } finally {
     client.release();
@@ -313,10 +686,27 @@ router.get("/mine", authenticateToken, async (req, res) => {
          i.attributes_json->>'company' AS company,
          ST_Y(r.location_point::geometry) AS latitude,
          ST_X(r.location_point::geometry) AS longitude,
-         r.created_at
+         r.created_at,
+         r.recovery_mode,
+         r.authority_id,
+         ad.name AS authority_name,
+         latest_custody.custody_transfer_id,
+         latest_custody.custody_status,
+         latest_custody.initiated_at AS custody_initiated_at,
+         latest_custody.received_at AS custody_received_at
        FROM reports r
        JOIN items i ON i.item_id = r.item_id
+       LEFT JOIN authority_destinations ad ON ad.authority_id = r.authority_id
+       LEFT JOIN LATERAL (
+         SELECT custody_transfer_id, custody_status, initiated_at, received_at
+         FROM custody_transfer_requests ctr WHERE ctr.report_id = r.report_id
+         ORDER BY initiated_at DESC, custody_transfer_id DESC LIMIT 1
+       ) latest_custody ON TRUE
        WHERE r.user_id = $1
+         AND NOT (r.report_type = 'FOUND' AND EXISTS (
+           SELECT 1 FROM custody_transfer_requests received
+           WHERE received.report_id = r.report_id AND received.custody_status = 'RECEIVED'
+         ))
        ORDER BY r.created_at DESC`,
       [req.user.userId]
     );
@@ -411,6 +801,8 @@ router.patch("/:id", authenticateToken, async (req, res) => {
        WHERE r.report_id = $1
          AND r.user_id = $2
          AND r.status = 'OPEN'
+         AND NOT EXISTS (SELECT 1 FROM custody_transfer_requests ctr
+                         WHERE ctr.report_id = r.report_id AND ctr.custody_status = 'RECEIVED')
        FOR UPDATE`,
       [reportId, req.user.userId]
     );
@@ -492,33 +884,49 @@ router.patch("/:id/close", authenticateToken, async (req, res) => {
     return res.status(400).json({ error: "Invalid report ID" });
   }
 
+  const client = await pool.connect();
   try {
-    const result = await pool.query(
-      `UPDATE reports
-       SET status = 'CANCELLED'
-       WHERE report_id = $1
-         AND user_id = $2
-         AND status = 'OPEN'
-       RETURNING report_id, report_type, status`,
+    await client.query("BEGIN");
+    const report = await client.query(
+      `SELECT report_id, report_type, authority_id
+       FROM reports r WHERE report_id=$1 AND user_id=$2 AND status='OPEN'
+         AND NOT EXISTS (SELECT 1 FROM custody_transfer_requests ctr
+                         WHERE ctr.report_id=r.report_id AND ctr.custody_status='RECEIVED')
+       FOR UPDATE`,
       [reportId, req.user.userId]
     );
-
-    if (result.rowCount === 0) {
-      return res.status(404).json({
-        error: "Open report not found",
-      });
+    if (!report.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Open report not found" });
     }
-
-    return res.json({
-      message: "Report closed successfully",
-      report: result.rows[0],
-    });
+    const pending = await client.query(
+      `UPDATE custody_transfer_requests SET custody_status='CANCELLED', cancelled_at=NOW(), updated_at=NOW()
+       WHERE report_id=$1 AND custody_status='PENDING_RECEIPT'
+       RETURNING custody_transfer_id, authority_id`,
+      [reportId]
+    );
+    for (const transfer of pending.rows) {
+      await client.query(
+        `INSERT INTO audit_logs (actor_user_id, action_type, entity_type, entity_id, metadata)
+         VALUES ($1, 'CUSTODY_TRANSFER_CANCELLED', 'CUSTODY_TRANSFER', $2, $3::jsonb)`,
+        [req.user.userId, transfer.custody_transfer_id, JSON.stringify({ reportId: Number(reportId), authorityId: Number(transfer.authority_id), reason: "REPORT_CLOSED" })]
+      );
+    }
+    const updated = await client.query(
+      `UPDATE reports SET status='CANCELLED', updated_at=NOW() WHERE report_id=$1
+       RETURNING report_id, report_type, status`,
+      [reportId]
+    );
+    await client.query("COMMIT");
+    return res.json({ message: "Report closed successfully", report: updated.rows[0] });
   } catch (error) {
+    try { await client.query("ROLLBACK"); } catch { /* retain original error */ }
     console.error("Close report failed:", error.message);
-
     return res.status(500).json({
       error: "Unable to close report",
     });
+  } finally {
+    client.release();
   }
 });
 

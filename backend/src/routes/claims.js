@@ -4,6 +4,8 @@ const pool = require("../config/db");
 const authenticateToken = require("../middleware/auth");
 const crypto = require("node:crypto");
 const { MATCH_SCORE_THRESHOLD } = require("../config/matching");
+const { createNotification } = require("../notifications");
+const { isCurrentReviewer, isCurrentAdmin, canReviewClaim } = require("../authorityAccess");
 
 const router = express.Router();
 
@@ -29,8 +31,15 @@ router.get("/", authenticateToken, async (req, res) => {
           lost.user_id AS lost_report_owner_id,
           lost.status AS lost_report_status,
           found.report_id AS found_report_id,
+
           found.user_id AS found_report_owner_id,
+          found.recovery_mode AS found_recovery_mode,
+          found.authority_id AS found_authority_id,
+          found_authority.name AS found_authority_name,
+          EXISTS (SELECT 1 FROM custody_transfer_requests ctr
+                  WHERE ctr.report_id=found.report_id AND ctr.custody_status='RECEIVED') AS authority_custody_received,
           found.status AS found_report_status,
+          conv.conversation_status,
           CASE
             WHEN c.claimant_user_id = $1 THEN 'CLAIMANT'
             ELSE 'FOUND_REPORT_OWNER'
@@ -42,8 +51,10 @@ router.get("/", authenticateToken, async (req, res) => {
           ON lost.report_id = m.lost_report_id
         JOIN reports found
           ON found.report_id = m.found_report_id
+        LEFT JOIN authority_destinations found_authority ON found_authority.authority_id = found.authority_id
+        LEFT JOIN conversations conv ON conv.claim_id = c.claim_id
         WHERE c.claimant_user_id = $1
-           OR found.user_id = $1
+           OR (found.user_id = $1 AND found.recovery_mode = 'DIRECT')
         ORDER BY c.submitted_at DESC, c.claim_id DESC
       `,
       [userId]
@@ -91,6 +102,10 @@ router.post("/", authenticateToken, async (req, res) => {
           l.status AS lost_report_status,
           f.report_id AS found_report_id,
           f.user_id AS found_report_owner_id,
+          f.authority_id AS found_authority_id,
+          f.recovery_mode AS found_recovery_mode,
+          EXISTS (SELECT 1 FROM custody_transfer_requests ctr
+                  WHERE ctr.report_id=f.report_id AND ctr.custody_status='RECEIVED') AS custody_received,
           f.status AS found_report_status
         FROM match_records m
         JOIN reports l
@@ -147,6 +162,11 @@ router.post("/", authenticateToken, async (req, res) => {
       });
     }
 
+    if (match.found_recovery_mode === "AUTHORITY" && !match.custody_received) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "The assigned authority must confirm physical receipt before a claim can proceed" });
+    }
+
     // Do not allow the same user to submit a second active claim.
     const existingClaim = await client.query(
       `
@@ -186,6 +206,35 @@ router.post("/", authenticateToken, async (req, res) => {
       [matchId, userId]
     );
 
+    await client.query("INSERT INTO conversations (claim_id, conversation_status) VALUES ($1, 'OPEN')", [claimResult.rows[0].claim_id]);
+    await createNotification(client, userId, "CLAIM_SUBMITTED", "CLAIM", claimResult.rows[0].claim_id);
+    if (!match.found_authority_id) {
+      await createNotification(
+        client,
+        match.found_report_owner_id,
+        "NEW_CLAIM",
+        "CLAIM",
+        claimResult.rows[0].claim_id
+      );
+    }
+    if (match.found_authority_id) {
+      const assignedMembers = await client.query(
+        `SELECT DISTINCT am.user_id
+         FROM authority_memberships am
+         JOIN authority_destinations ad ON ad.authority_id=am.authority_id
+         JOIN users u ON u.user_id=am.user_id
+         WHERE am.authority_id=$1 AND am.membership_status='ACTIVE'
+           AND u.account_status='ACTIVE' AND ad.verification_status='VERIFIED'
+           AND ad.destination_status='ACTIVE'
+           AND EXISTS (SELECT 1 FROM custody_transfer_requests ctr
+                       WHERE ctr.report_id=$2 AND ctr.custody_status='RECEIVED')`,
+        [match.found_authority_id, match.found_report_id]
+      );
+      for (const member of assignedMembers.rows) {
+        await createNotification(client, member.user_id, "NEW_AUTHORITY_CLAIM", "CLAIM", claimResult.rows[0].claim_id);
+      }
+    }
+
     await client.query("COMMIT");
 
     return res.status(201).json({
@@ -219,7 +268,6 @@ router.post("/", authenticateToken, async (req, res) => {
   }
 });
 
-const REVIEW_ROLES = new Set(["STAFF", "ADMIN"]);
 const REVIEW_DECISIONS = new Set(["IN_REVIEW", "APPROVED", "REJECTED"]);
 const VERIFICATION_STATUSES = new Set(["PASSED", "FAILED", "NEEDS_REVIEW"]);
 const HANDOVER_CODE_TTL_MINUTES = 15;
@@ -249,12 +297,6 @@ function safeHashEquals(left, right) {
   );
 }
 
-function isReviewer(req, res) {
-  if (REVIEW_ROLES.has(req.user.role)) return true;
-  res.status(403).json({ error: "A staff or admin role is required" });
-  return false;
-}
-
 async function rollback(client) {
   if (!client) return;
   try {
@@ -267,9 +309,24 @@ async function rollback(client) {
 // GET /api/claims/review-queue
 // Reviewer-only queue. It intentionally omits evidence references and notes.
 router.get("/review-queue", authenticateToken, async (req, res) => {
-  if (!isReviewer(req, res)) return;
-
   try {
+    const [userIsAdmin, userIsReviewer] = await Promise.all([
+      isCurrentAdmin(pool, req.user.userId),
+      isCurrentReviewer(pool, req.user.userId),
+    ]);
+    const authorityMembership = await pool.query(`
+      SELECT EXISTS (
+        SELECT 1 FROM authority_memberships am
+        JOIN authority_destinations ad ON ad.authority_id = am.authority_id
+        JOIN users u ON u.user_id = am.user_id
+        WHERE am.user_id = $1 AND am.membership_status = 'ACTIVE'
+          AND ad.verification_status = 'VERIFIED' AND ad.destination_status = 'ACTIVE'
+          AND u.account_status = 'ACTIVE'
+      ) AS allowed
+    `, [req.user.userId]);
+    if (!userIsAdmin && !userIsReviewer && !authorityMembership.rows[0].allowed) {
+      return res.status(403).json({ error: 'You are not authorized to access the claim review queue' });
+    }
     const result = await pool.query(`
       SELECT
         c.claim_id,
@@ -280,12 +337,39 @@ router.get("/review-queue", authenticateToken, async (req, res) => {
         c.updated_at,
         m.total_score,
         lost.report_id AS lost_report_id,
+        lost.report_time AS lost_report_time,
+        lost.location_description AS lost_location_description,
+        lost_item.title AS lost_item_title,
+        lost_item.category AS lost_item_category,
+        lost_item.description AS lost_item_description,
+        lost_item.color AS lost_item_color,
+        lost_item.attributes_json->>'company' AS lost_item_company,
+        lost_item.attributes_json->>'model' AS lost_item_model,
         found.report_id AS found_report_id,
+        found.report_time AS found_report_time,
+        found.location_description AS found_location_description,
+        found_item.title AS found_item_title,
+        found_item.category AS found_item_category,
+        found_item.description AS found_item_description,
+        found_item.color AS found_item_color,
+        found_item.attributes_json->>'company' AS found_item_company,
+        found_item.attributes_json->>'model' AS found_item_model,
+        claimant.name AS claimant_name,
+        found_authority.name AS found_authority_name,
+        found.recovery_mode AS found_recovery_mode,
+        EXISTS (SELECT 1 FROM custody_transfer_requests ctr WHERE ctr.report_id=found.report_id AND ctr.custody_status='RECEIVED') AS authority_custody_received,
+        conv.conversation_status,
+
         latest.verification_status AS latest_verification_status
       FROM claim_requests c
       JOIN match_records m ON m.match_id = c.match_id
       JOIN reports lost ON lost.report_id = m.lost_report_id
       JOIN reports found ON found.report_id = m.found_report_id
+      JOIN items lost_item ON lost_item.item_id=lost.item_id
+      JOIN items found_item ON found_item.item_id=found.item_id
+      JOIN users claimant ON claimant.user_id=c.claimant_user_id
+      LEFT JOIN authority_destinations found_authority ON found_authority.authority_id=found.authority_id
+      LEFT JOIN conversations conv ON conv.claim_id=c.claim_id
       LEFT JOIN LATERAL (
         SELECT verification_status
         FROM claim_verifications
@@ -294,9 +378,19 @@ router.get("/review-queue", authenticateToken, async (req, res) => {
         LIMIT 1
       ) latest ON TRUE
       WHERE c.claim_status IN ('SUBMITTED', 'IN_REVIEW')
+        AND ($1::boolean OR (found.authority_id IS NULL AND $2::boolean) OR EXISTS (
+          SELECT 1 FROM authority_memberships am
+          JOIN authority_destinations ad ON ad.authority_id = am.authority_id
+          JOIN users u ON u.user_id = am.user_id
+          JOIN custody_transfer_requests ctr ON ctr.report_id = found.report_id
+          WHERE am.user_id = $3 AND am.authority_id = found.authority_id
+            AND am.membership_status = 'ACTIVE' AND u.account_status = 'ACTIVE'
+            AND ad.verification_status = 'VERIFIED' AND ad.destination_status = 'ACTIVE'
+            AND ctr.custody_status = 'RECEIVED'
+        ))
       ORDER BY c.submitted_at ASC, c.claim_id ASC
       LIMIT 100
-    `);
+      `, [userIsAdmin, userIsReviewer, req.user.userId]);
 
     return res.json({ count: result.rowCount, claims: result.rows });
   } catch (error) {
@@ -308,13 +402,15 @@ router.get("/review-queue", authenticateToken, async (req, res) => {
 // GET /api/claims/:claimId/verifications
 // Private review notes are available only to staff/admin reviewers.
 router.get("/:claimId/verifications", authenticateToken, async (req, res) => {
-  if (!isReviewer(req, res)) return;
   const claimId = parseClaimId(req.params.claimId);
   if (!claimId) {
     return res.status(400).json({ error: "A valid claimId is required" });
   }
 
   try {
+    if (!(await canReviewClaim(pool, req.user.userId, claimId))) {
+      return res.status(403).json({ error: "You are not authorized to review this claim" });
+    }
     const result = await pool.query(
       `SELECT verification_id, claim_id, reviewer_user_id, verification_type,
               verification_status, review_notes_private, created_at, reviewed_at
@@ -333,8 +429,6 @@ router.get("/:claimId/verifications", authenticateToken, async (req, res) => {
 // POST /api/claims/:claimId/verifications
 // Only staff/admin can create private verification records.
 router.post("/:claimId/verifications", authenticateToken, async (req, res) => {
-  if (!isReviewer(req, res)) return;
-
   const claimId = parseClaimId(req.params.claimId);
   const verificationType = req.body?.verificationType;
   const verificationStatus = req.body?.status;
@@ -364,13 +458,14 @@ router.post("/:claimId/verifications", authenticateToken, async (req, res) => {
     client = await pool.connect();
     await client.query("BEGIN");
     const claimResult = await client.query(
-      `SELECT c.claim_id, c.claim_status, m.match_id, m.match_status,
+      `SELECT c.claim_id, c.claim_status, c.claimant_user_id, m.match_id, m.match_status,
               m.lost_report_id, m.found_report_id,
               lost.status AS lost_status, found.status AS found_status
        FROM claim_requests c
        JOIN match_records m ON m.match_id = c.match_id
        JOIN reports lost ON lost.report_id = m.lost_report_id
        JOIN reports found ON found.report_id = m.found_report_id
+      LEFT JOIN conversations conv ON conv.claim_id=c.claim_id
        WHERE c.claim_id = $1
        FOR UPDATE OF c, m, lost, found`,
       [claimId]
@@ -380,6 +475,10 @@ router.post("/:claimId/verifications", authenticateToken, async (req, res) => {
       return res.status(404).json({ error: "Claim not found" });
     }
     const claim = claimResult.rows[0];
+    if (!(await canReviewClaim(client, req.user.userId, claimId))) {
+      await rollback(client);
+      return res.status(403).json({ error: "You are not authorized to review this claim" });
+    }
     if (!["SUBMITTED", "IN_REVIEW"].includes(claim.claim_status)) {
       await rollback(client);
       return res.status(409).json({ error: "Claim is not open for verification" });
@@ -406,7 +505,8 @@ router.post("/:claimId/verifications", authenticateToken, async (req, res) => {
     if (claim.claim_status === "SUBMITTED") {
       await client.query(
         `UPDATE claim_requests SET claim_status = 'IN_REVIEW', updated_at = NOW()
-         WHERE claim_id = $1 AND claim_status = 'SUBMITTED'`,
+         WHERE claim_id = $1 AND claim_status = 'SUBMITTED'
+         RETURNING claimant_user_id`,
         [claimId]
       );
       const matchUpdate = await client.query(
@@ -427,6 +527,7 @@ router.post("/:claimId/verifications", authenticateToken, async (req, res) => {
       if (reportUpdate.rowCount !== 2) {
         throw new Error("Report statuses changed while starting claim review");
       }
+      await createNotification(client, claim.claimant_user_id, "CLAIM_IN_REVIEW", "CLAIM", claimId);
     }
 
     await client.query(
@@ -450,8 +551,6 @@ router.post("/:claimId/verifications", authenticateToken, async (req, res) => {
 // PATCH /api/claims/:claimId/review
 // Moves SUBMITTED -> IN_REVIEW (via verification) -> APPROVED/REJECTED.
 router.patch("/:claimId/review", authenticateToken, async (req, res) => {
-  if (!isReviewer(req, res)) return;
-
   const claimId = parseClaimId(req.params.claimId);
   const decision = req.body?.decision;
   const privateNote = req.body?.privateNote;
@@ -476,13 +575,14 @@ router.patch("/:claimId/review", authenticateToken, async (req, res) => {
     client = await pool.connect();
     await client.query("BEGIN");
     const result = await client.query(
-      `SELECT c.claim_id, c.claim_status, c.match_id,
+      `SELECT c.claim_id, c.claim_status, c.claimant_user_id, c.match_id,
               m.match_status, m.lost_report_id, m.found_report_id,
               lost.status AS lost_status, found.status AS found_status
        FROM claim_requests c
        JOIN match_records m ON m.match_id = c.match_id
        JOIN reports lost ON lost.report_id = m.lost_report_id
        JOIN reports found ON found.report_id = m.found_report_id
+      LEFT JOIN conversations conv ON conv.claim_id=c.claim_id
        WHERE c.claim_id = $1
        FOR UPDATE OF c, m, lost, found`,
       [claimId]
@@ -492,6 +592,10 @@ router.patch("/:claimId/review", authenticateToken, async (req, res) => {
       return res.status(404).json({ error: "Claim not found" });
     }
     const claim = result.rows[0];
+    if (!(await canReviewClaim(client, req.user.userId, claimId))) {
+      await rollback(client);
+      return res.status(403).json({ error: "You are not authorized to review this claim" });
+    }
     if (claim.claim_status !== "IN_REVIEW") {
       await rollback(client);
       return res.status(409).json({ error: "Only claims in review can be approved or rejected" });
@@ -526,6 +630,7 @@ router.patch("/:claimId/review", authenticateToken, async (req, res) => {
       return res.status(409).json({ error: "Claim status changed; reload and try again" });
     }
 
+    if (decision === "REJECTED") await client.query("UPDATE conversations SET conversation_status='CLOSED' WHERE claim_id=$1 AND conversation_status='OPEN'", [claimId]);
     const matchStatus = decision === "APPROVED" ? "CLAIM_PENDING" : "REJECTED";
     const matchUpdate = await client.query(
       `UPDATE match_records SET match_status = $2
@@ -558,6 +663,13 @@ router.patch("/:claimId/review", authenticateToken, async (req, res) => {
        VALUES ($1, $2, 'CLAIM', $3, $4::jsonb)`,
       [req.user.userId, `CLAIM_${decision}`, claimId, JSON.stringify({ previousStatus: claim.claim_status })]
     );
+    await createNotification(
+      client,
+      claim.claimant_user_id,
+      decision === "APPROVED" ? "CLAIM_APPROVED" : "CLAIM_REJECTED",
+      "CLAIM",
+      claimId
+    );
     await client.query("COMMIT");
     return res.json({ claim: updated.rows[0], matchStatus });
   } catch (error) {
@@ -582,7 +694,10 @@ router.post("/:claimId/handover/code", authenticateToken, async (req, res) => {
     client = await pool.connect();
     await client.query("BEGIN");
     const result = await client.query(
-      `SELECT c.claim_id, c.claim_status, m.found_report_id, f.user_id AS found_owner_id
+      `SELECT c.claim_id, c.claim_status, m.found_report_id, f.user_id AS found_owner_id,
+              f.authority_id, f.recovery_mode,
+              EXISTS (SELECT 1 FROM custody_transfer_requests ctr
+                      WHERE ctr.report_id = f.report_id AND ctr.custody_status = 'RECEIVED') AS custody_received
        FROM claim_requests c
        JOIN match_records m ON m.match_id = c.match_id
        JOIN reports f ON f.report_id = m.found_report_id
@@ -595,9 +710,13 @@ router.post("/:claimId/handover/code", authenticateToken, async (req, res) => {
       return res.status(404).json({ error: "Claim not found" });
     }
     const claim = result.rows[0];
-    if (Number(claim.found_owner_id) !== req.user.userId) {
+    const finderStillCustodian = Number(claim.found_owner_id) === req.user.userId &&
+      !(claim.recovery_mode === "AUTHORITY" && claim.custody_received);
+    const authorityCanRelease = claim.recovery_mode === "AUTHORITY" && claim.custody_received &&
+      await canReviewClaim(client, req.user.userId, claimId);
+    if (!finderStillCustodian && !authorityCanRelease) {
       await rollback(client);
-      return res.status(403).json({ error: "Only the found-report owner can issue a handover code" });
+      return res.status(403).json({ error: "Only the responsible finder or assigned authority may issue a handover code" });
     }
     if (claim.claim_status !== "APPROVED") {
       await rollback(client);
@@ -679,11 +798,13 @@ router.post("/:claimId/handover/confirm", authenticateToken, async (req, res) =>
     await client.query("BEGIN");
     const result = await client.query(
       `SELECT c.claim_id, c.claim_status, c.claimant_user_id, c.match_id,
-              m.lost_report_id, m.found_report_id,
+              m.lost_report_id, m.found_report_id, found.user_id AS found_report_owner_id,
               h.handover_id, h.handover_status, h.code_hash,
               h.code_expires_at, h.code_used_at
        FROM claim_requests c
        JOIN match_records m ON m.match_id = c.match_id
+       JOIN reports found ON found.report_id = m.found_report_id
+      LEFT JOIN conversations conv ON conv.claim_id=c.claim_id
        LEFT JOIN handover_records h ON h.claim_id = c.claim_id
        WHERE c.claim_id = $1
        FOR UPDATE OF c, m`,
@@ -770,17 +891,213 @@ router.post("/:claimId/handover/confirm", authenticateToken, async (req, res) =>
     if (!claimUpdate.rowCount || !matchUpdate.rowCount || reportsUpdate.rowCount !== 2) {
       throw new Error("Related statuses changed while completing handover");
     }
+    await client.query("UPDATE conversations SET conversation_status='CLOSED' WHERE claim_id=$1 AND conversation_status='OPEN'", [claimId]);
     await client.query(
       `INSERT INTO audit_logs (actor_user_id, action_type, entity_type, entity_id, metadata)
        VALUES ($1, 'HANDOVER_COMPLETED', 'CLAIM', $2, '{}'::jsonb)`,
       [req.user.userId, claimId]
     );
+    await createNotification(client, claim.claimant_user_id, "HANDOVER_COMPLETED", "CLAIM", claimId);
+    await createNotification(client, claim.found_report_owner_id, "HANDOVER_COMPLETED", "CLAIM", claimId);
     await client.query("COMMIT");
     return res.json({ handover: handover.rows[0], claimStatus: "COMPLETED" });
   } catch (error) {
     await rollback(client);
     console.error("Confirm handover failed:", error.message);
     return res.status(500).json({ error: "Unable to confirm handover" });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+// GET /api/claims/:claimId/photos
+// Returns private/shared state and metadata to the claimant, finder, or reviewer.
+router.get("/:claimId/photos", authenticateToken, async (req, res) => {
+  const claimId = parseClaimId(req.params.claimId);
+  if (!claimId) return res.status(400).json({ error: "A valid claimId is required" });
+  try {
+    const claimResult = await pool.query(
+      `SELECT c.claimant_user_id, c.claim_status, m.found_report_id, f.item_id, f.authority_id,
+              f.user_id AS finder_id, conv.conversation_status,
+              share.granted_by_user_id, share.granted_at, share.revoked_at
+       FROM claim_requests c
+       JOIN match_records m ON m.match_id = c.match_id
+       JOIN reports f ON f.report_id = m.found_report_id AND f.report_type = 'FOUND'
+       LEFT JOIN conversations conv ON conv.claim_id = c.claim_id
+       LEFT JOIN LATERAL (
+         SELECT granted_by_user_id, granted_at, revoked_at
+         FROM claim_photo_shares WHERE claim_id = c.claim_id AND revoked_at IS NULL
+         ORDER BY granted_at DESC LIMIT 1
+       ) share ON TRUE
+       WHERE c.claim_id = $1`,
+      [claimId]
+    );
+    if (!claimResult.rowCount) return res.status(404).json({ error: "Claim not found" });
+    const claim = claimResult.rows[0];
+    const isFinder = Number(claim.finder_id) === req.user.userId;
+    const isClaimant = Number(claim.claimant_user_id) === req.user.userId;
+    const canReview = await canReviewClaim(pool, req.user.userId, claimId);
+    const currentUser = await pool.query("SELECT role FROM users WHERE user_id=$1 AND account_status='ACTIVE'", [req.user.userId]);
+    const isGlobalReviewer = canReview && (currentUser.rows[0]?.role === 'ADMIN' || (currentUser.rows[0]?.role === 'STAFF' && !claim.authority_id));
+    const isAuthorityReviewer = canReview && !isGlobalReviewer;
+    if (!isFinder && !isClaimant && !canReview) {
+      return res.status(403).json({ error: "You are not authorized to view this claim's photo state" });
+    }
+    const shared = claim.revoked_at == null && claim.granted_at != null;
+    const canViewPhotos = isFinder || (isClaimant && shared) ||
+      (isGlobalReviewer && claim.conversation_status === "OPEN") ||
+      (isAuthorityReviewer && shared && claim.conversation_status === "OPEN");
+    const photosResult = canViewPhotos
+      ? await pool.query(
+        `SELECT p.photo_id, p.photo_type, p.uploaded_at
+         FROM item_photos p JOIN reports f ON f.item_id = p.item_id
+         WHERE f.report_id = $1 ORDER BY p.photo_type, p.photo_id`,
+        [claim.found_report_id]
+      )
+      : { rows: [] };
+    const requiredViews = await pool.query(
+      `SELECT COUNT(DISTINCT photo_type)::int AS count
+       FROM item_photos WHERE item_id = $1 AND photo_type IN ('FRONT', 'BACK', 'SIDE')`,
+      [claim.item_id]
+    );
+    return res.json({
+      sharingStatus: shared ? "SHARED" : "PRIVATE",
+      conversationOpen: claim.conversation_status === "OPEN",
+      requiredViewsComplete: requiredViews.rows[0].count === 3,
+      canGrant: claim.conversation_status === "OPEN" && (isFinder || canReview) && requiredViews.rows[0].count === 3,
+      canRevoke: shared && (Number(claim.granted_by_user_id) === req.user.userId || canReview),
+      photos: photosResult.rows.map((row) => ({
+        photoId: String(row.photo_id), photoType: row.photo_type, uploadedAt: row.uploaded_at,
+      })),
+    });
+  } catch (error) {
+    console.error("Get claim photo access failed:", error.message);
+    return res.status(500).json({ error: "Unable to retrieve claim photo access" });
+  }
+});
+
+// POST /api/claims/:claimId/photo-sharing
+// Explicit, claim-specific grant; an OPEN conversation is required.
+router.post("/:claimId/photo-sharing", authenticateToken, async (req, res) => {
+  const claimId = parseClaimId(req.params.claimId);
+  if (!claimId) return res.status(400).json({ error: "A valid claimId is required" });
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+    const result = await client.query(
+      `SELECT c.claim_status, f.user_id AS finder_id, f.item_id, f.authority_id, conv.conversation_status
+       FROM claim_requests c
+       JOIN match_records m ON m.match_id = c.match_id
+       JOIN reports f ON f.report_id = m.found_report_id AND f.report_type = 'FOUND'
+       LEFT JOIN conversations conv ON conv.claim_id = c.claim_id
+       WHERE c.claim_id = $1
+       FOR UPDATE OF c, m, f`,
+      [claimId]
+    );
+    if (!result.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Claim not found" });
+    }
+    const claim = result.rows[0];
+    if (Number(claim.finder_id) !== req.user.userId && !(await canReviewClaim(client, req.user.userId, claimId))) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Only the found-item owner or staff/admin may share photos" });
+    }
+    if (claim.conversation_status !== "OPEN" || !["SUBMITTED", "IN_REVIEW", "APPROVED"].includes(claim.claim_status)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Photo sharing requires an open conversation for an active claim" });
+    }
+    const requiredViews = await client.query(
+      `SELECT COUNT(DISTINCT photo_type)::int AS count
+       FROM item_photos WHERE item_id = $1 AND photo_type IN ('FRONT', 'BACK', 'SIDE')`,
+      [claim.item_id]
+    );
+    if (requiredViews.rows[0].count !== 3) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Front, Back, and Side photos are required before sharing" });
+    }
+    const active = await client.query(
+      `SELECT photo_share_id FROM claim_photo_shares
+       WHERE claim_id = $1 AND revoked_at IS NULL FOR UPDATE`,
+      [claimId]
+    );
+    if (active.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "Photos are already shared for this claim" });
+    }
+    const grant = await client.query(
+      `INSERT INTO claim_photo_shares (claim_id, granted_by_user_id)
+       VALUES ($1, $2) RETURNING photo_share_id, granted_at`,
+      [claimId, req.user.userId]
+    );
+    await client.query(
+      `INSERT INTO audit_logs (actor_user_id, action_type, entity_type, entity_id, metadata)
+       VALUES ($1, 'CLAIM_PHOTOS_SHARED', 'CLAIM', $2, $3::jsonb)`,
+      [req.user.userId, claimId, JSON.stringify({ photoShareId: grant.rows[0].photo_share_id })]
+    );
+    await client.query("COMMIT");
+    return res.status(201).json({ sharingStatus: "SHARED", grantedAt: grant.rows[0].granted_at });
+  } catch (error) {
+    if (client) {
+      try { await client.query("ROLLBACK"); } catch { /* retain original error */ }
+    }
+    console.error("Grant claim photo access failed:", error.message);
+    return res.status(error.code === "23505" ? 409 : 500).json({ error: error.code === "23505" ? "Photos are already shared for this claim" : "Unable to share claim photos" });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+// DELETE /api/claims/:claimId/photo-sharing
+// Original grantor or STAFF/ADMIN may revoke; revocation is effective immediately.
+router.delete("/:claimId/photo-sharing", authenticateToken, async (req, res) => {
+  const claimId = parseClaimId(req.params.claimId);
+  if (!claimId) return res.status(400).json({ error: "A valid claimId is required" });
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+    const grant = await client.query(
+      `SELECT s.photo_share_id, s.granted_by_user_id, f.user_id AS finder_id
+       FROM claim_photo_shares s
+       JOIN claim_requests c ON c.claim_id = s.claim_id
+       JOIN match_records m ON m.match_id = c.match_id
+       JOIN reports f ON f.report_id = m.found_report_id AND f.report_type = 'FOUND'
+       WHERE s.claim_id = $1 AND s.revoked_at IS NULL
+       FOR UPDATE OF s`,
+      [claimId]
+    );
+    if (!grant.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Active photo share not found" });
+    }
+    if (
+      Number(grant.rows[0].granted_by_user_id) !== req.user.userId &&
+      Number(grant.rows[0].finder_id) !== req.user.userId &&
+      !(await canReviewClaim(client, req.user.userId, claimId))
+    ) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Only the grantor or staff/admin may revoke photo access" });
+    }
+    await client.query(
+      `UPDATE claim_photo_shares SET revoked_at = NOW(), revoked_by_user_id = $2
+       WHERE photo_share_id = $1`,
+      [grant.rows[0].photo_share_id, req.user.userId]
+    );
+    await client.query(
+      `INSERT INTO audit_logs (actor_user_id, action_type, entity_type, entity_id, metadata)
+       VALUES ($1, 'CLAIM_PHOTOS_REVOKED', 'CLAIM', $2, $3::jsonb)`,
+      [req.user.userId, claimId, JSON.stringify({ photoShareId: grant.rows[0].photo_share_id })]
+    );
+    await client.query("COMMIT");
+    return res.json({ sharingStatus: "PRIVATE" });
+  } catch (error) {
+    if (client) {
+      try { await client.query("ROLLBACK"); } catch { /* retain original error */ }
+    }
+    console.error("Revoke claim photo access failed:", error.message);
+    return res.status(500).json({ error: "Unable to revoke claim photo access" });
   } finally {
     if (client) client.release();
   }

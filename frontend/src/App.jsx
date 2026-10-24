@@ -10,10 +10,15 @@ import {
   refreshMatchCandidates,
   getMyClaims,
   submitClaim,
+  getAuthorityDestinations,
+  getAuthorityMemberships,
 } from './api'
 import './App.css'
 import LocationPicker from './components/LocationPicker'
 import ClaimWorkflow from './components/ClaimWorkflow'
+import FoundPhotoCapture from './components/FoundPhotoCapture'
+import NotificationCenter from './components/NotificationCenter'
+import AuthorityPortal from './components/AuthorityPortal'
 import { filterAndSortMatches } from './matchFilters'
 import { getMatchClaimState } from './claimCardState'
 
@@ -61,6 +66,8 @@ const [reportForm, setReportForm] = useState({
   latitude: '',
   longitude: '',
   locationDescription: '',
+  recoveryMode: 'DIRECT',
+  authorityId: '',
 })
 const [uncertaintyRadiusM, setUncertaintyRadiusM] = useState(75)
 const [reportLoading, setReportLoading] = useState(false)
@@ -70,6 +77,9 @@ const [reportError, setReportError] = useState('')
 const [myReports, setMyReports] = useState([])
 const [reportsLoading, setReportsLoading] = useState(false)
 const [reportsError, setReportsError] = useState('')
+const [authorityDestinations, setAuthorityDestinations] = useState([])
+const [authorityDestinationsError, setAuthorityDestinationsError] = useState('')
+const [hasAuthorityAccess, setHasAuthorityAccess] = useState(false)
 const [myMatches, setMyMatches] = useState([])
 const [matchesLoading, setMatchesLoading] = useState(false)
 const [matchesError, setMatchesError] = useState('')
@@ -101,6 +111,10 @@ const [authToken, setAuthToken] = useState(() => {
     return null
   }
 })
+const hasFoundReports = myReports.some((report) => report.report_type === 'FOUND')
+const hasAuthorityDashboard = ["STAFF", "ADMIN"].includes(currentUser?.role) || hasAuthorityAccess
+const [authorityAccessLoading, setAuthorityAccessLoading] = useState(Boolean(authToken && currentUser?.role === 'USER'))
+const isOperationsUser = currentUser?.role === 'ADMIN' || hasAuthorityAccess || (currentUser?.role === 'USER' && authorityAccessLoading)
 
   function openAuth(mode) {
     setAuthMode(mode)
@@ -140,6 +154,7 @@ const [authToken, setAuthToken] = useState(() => {
         'lostlink_session',
         JSON.stringify({ user: result.user, token: result.token }),
       )
+      setAuthorityAccessLoading(result.user?.role === 'USER')
       setCurrentUser(result.user)
       setAuthToken(result.token)
       setAuthMessage(
@@ -204,6 +219,8 @@ attributes:
       locationAccuracyM: null,
       locationSource: 'MAP_PIN',
       locationDescription: reportForm.locationDescription.trim() || null,
+      recoveryMode: reportForm.reportType === 'FOUND' ? reportForm.recoveryMode : 'DIRECT',
+      authorityId: reportForm.reportType === 'FOUND' && reportForm.recoveryMode === 'AUTHORITY' ? reportForm.authorityId : null,
     })
 
     setReportMessage(result.message || 'Report submitted successfully!')
@@ -219,6 +236,8 @@ attributes:
      latitude: '',
       longitude: '',
       locationDescription: '',
+      recoveryMode: 'DIRECT',
+      authorityId: '',
     })
   } catch (error) {
     setReportError(error.message || 'Could not submit the report.')
@@ -400,9 +419,22 @@ async function handleCloseReport(reportId) {
 
 useEffect(() => {
   if (authToken) {
+    if (currentUser?.role === 'USER') setAuthorityAccessLoading(true)
+    getAuthorityMemberships(authToken).then((result) => {
+      setHasAuthorityAccess((result.memberships || []).some((membership) => membership.membership_status === 'ACTIVE' && membership.verification_status === 'VERIFIED' && membership.destination_status === 'ACTIVE'))
+    }).catch(() => setHasAuthorityAccess(false)).finally(() => setAuthorityAccessLoading(false))
     loadMyReports()
+    getAuthorityDestinations(authToken)
+      .then((result) => {
+        setAuthorityDestinations(result.destinations || [])
+        setAuthorityDestinationsError('')
+      })
+      .catch((error) => setAuthorityDestinationsError(error.message || 'Could not load authority destinations.'))
   } else {
+    setHasAuthorityAccess(false)
+    setAuthorityAccessLoading(false)
     setMyReports([])
+    setAuthorityDestinations([])
   }
 }, [authToken])
 
@@ -420,7 +452,7 @@ function updateMatchFilter(event) {
 }
 
   return (
-    <div className="app">
+      <div className={`app${isOperationsUser ? ' operations-user-app' : ''}`}>
       <header className="navbar">
         <a className="brand" href="#">
           <span className="brand-icon">L</span>
@@ -428,18 +460,27 @@ function updateMatchFilter(event) {
         </a>
 
         <nav className="nav-links">
+          {isOperationsUser ? (
+            <>
+              <a href="#authority-portal">{currentUser?.role === 'ADMIN' ? 'Admin dashboard' : 'Authority dashboard'}</a>
+              <a href="#claim-review">Review claims</a>
+            </>
+          ) : <>
           <a href="#how-it-works">How it works</a>
           <a href="#my-matches">My Matches</a>
+          {currentUser && (hasAuthorityDashboard || hasFoundReports) && <a href="#authority-portal">{currentUser.role === 'ADMIN' ? 'Admin dashboard' : hasAuthorityDashboard ? 'Authority dashboard' : 'My return plan'}</a>}
           <a href="#safety">Safety</a>
+          </>}
         </nav>
 
         <div className="nav-actions">
           {currentUser ? (
             <>
+<NotificationCenter token={authToken} />
 <span className="welcome-user">
   Hi, {currentUser.name}
 </span>
-<button
+{!isOperationsUser && <button
   className="btn btn-ghost"
   onClick={async () => {
     await loadMyMatches({ refresh: true })
@@ -449,17 +490,16 @@ function updateMatchFilter(event) {
   }}
 >
   My matches
-</button>
-<a className="btn btn-ghost" href="#my-claims">My claims</a>
-{['STAFF', 'ADMIN'].includes(currentUser.role) && (
-  <a className="btn btn-ghost" href="#claim-review">Review claims</a>
-)}
+</button>}
+{!isOperationsUser && <a className="btn btn-ghost" href="#my-claims">My claims</a>}
+{(["STAFF", "ADMIN"].includes(currentUser.role) || hasAuthorityAccess) && <a className="btn btn-ghost" href="#claim-review">Review claims</a>}
 <button
   className="btn btn-ghost"
   onClick={() => {
     sessionStorage.removeItem('lostlink_session')
     setAuthToken(null)
     setCurrentUser(null)
+    setHasAuthorityAccess(false)
     setMyReports([])
     setMyMatches([])
     setMatchScoreThreshold(null)
@@ -496,7 +536,7 @@ function updateMatchFilter(event) {
         </div>
       )}
 
-      <main>
+      <main className={isOperationsUser ? 'operations-mode' : undefined}>
         <section className="hero-section">
           <div className="hero-content">
             <div className="eyebrow">
@@ -763,6 +803,27 @@ function updateMatchFilter(event) {
     placeholder="e.g. Near the library entrance"
   />
 
+  {activeTab === 'found' && (
+    <div className="recovery-choice">
+      <h4>How would you like to return this item?</h4>
+      <p>You can arrange the return directly, or hand the item to a verified authority. If you choose an authority, you are finished once its staff confirm physical receipt with your one-time code.</p>
+      <label htmlFor="recovery-mode">Choose how you want to proceed</label>
+      <select id="recovery-mode" value={reportForm.recoveryMode} onChange={(event) => setReportForm((previous) => ({ ...previous, recoveryMode: event.target.value, authorityId: '' }))}>
+        <option value="DIRECT">I will coordinate the return myself</option>
+        <option value="AUTHORITY">I will hand it to an authority</option>
+      </select>
+      {reportForm.recoveryMode === 'AUTHORITY' && <>
+        <label htmlFor="recovery-authority">Verified authority destination</label>
+        <select id="recovery-authority" required value={reportForm.authorityId} onChange={(event) => setReportForm((previous) => ({ ...previous, authorityId: event.target.value }))}>
+          <option value="">Choose a destination</option>
+          {authorityDestinations.map((destination) => <option value={destination.authority_id} key={destination.authority_id}>{destination.name}{destination.destination_type === 'CENTRAL' ? ' · LostLink central team' : destination.location_description ? ` · ${destination.location_description}` : ''}</option>)}
+        </select>
+        {authorityDestinationsError && <p className="auth-error" role="alert">{authorityDestinationsError}</p>}
+        {!authorityDestinations.length && !authorityDestinationsError && <p>No verified, active destinations are available yet. You can submit a direct-recovery report.</p>}
+      </>}
+    </div>
+  )}
+
   {reportError && (
     <p className="auth-error" role="alert">{reportError}</p>
   )}
@@ -1014,11 +1075,15 @@ function updateMatchFilter(event) {
     )}
   </div>
 )}
+          {report.report_type === 'FOUND' && currentUser && (
+            <FoundPhotoCapture token={authToken} report={report} />
+          )}
         </article>
       ))}
     </div>
   )}
 </section>
+{currentUser && (hasAuthorityDashboard || hasFoundReports) && <AuthorityPortal token={authToken} user={currentUser} onLogin={() => openAuth('login')} />}
 <section className="my-reports-section" id="my-matches">
   <div className="section-heading">
     <span className="section-kicker">MATCHING</span>
@@ -1227,6 +1292,7 @@ function updateMatchFilter(event) {
 <ClaimWorkflow
   token={authToken}
   user={currentUser}
+  hidePersonalClaims={isOperationsUser}
   claims={claimsForMatches}
   onClaimsChange={handleClaimsChange}
   onRefresh={refreshClaimRelatedData}
@@ -1240,14 +1306,14 @@ function updateMatchFilter(event) {
         </section>
       </main>
 
-      <footer className="footer">
+      {!isOperationsUser && <footer className="footer">
         <a className="brand" href="#">
           <span className="brand-icon">L</span>
           <span>Lost<span className="brand-accent">Link</span></span>
         </a>
         <span>Helping lost things find their way home.</span>
         <span>© {new Date().getFullYear()} LostLink</span>
-      </footer>
+      </footer>}
 
       {authMode && (
         <div

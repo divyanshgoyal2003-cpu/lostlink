@@ -1,0 +1,46 @@
+.claim-photo-access {
+  display: grid;
+  gap: 0.65rem;
+  width: 100%;
+  margin-top: 0.75rem;
+  padding: 0.85rem;
+  border: 1px solid #dbe6df;
+  border-radius: 10px;
+  background: #f7faf7;
+}
+
+.claim-photo-access-heading {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.claim-photo-access small,
+.claim-photo-access-heading small {
+  color: #52645d;
+  line-height: 1.45;
+}
+
+.claim-photo-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 0.6rem;
+}
+
+.claim-photo-gallery figure {
+  min-width: 0;
+  margin: 0;
+}
+
+.claim-photo-gallery img {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: contain;
+  background: #eef2ef;
+}
+
+.claim-photo-gallery figcaption {
+  margin-top: 0.25rem;
+  color: #52645d;
+  font-size: 0.8rem;
+  text-transform: capitalize;
+}
