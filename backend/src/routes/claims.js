@@ -74,7 +74,7 @@ router.get("/", authenticateToken, async (req, res) => {
       claims: result.rows,
     });
   } catch (error) {
-    console.error("Get claims failed:", error.message);
+    console.error("Get claims failed.");
 
     return res.status(500).json({
       error: "Unable to retrieve claims",
@@ -254,7 +254,7 @@ router.post("/", authenticateToken, async (req, res) => {
       try {
         await client.query("ROLLBACK");
       } catch (rollbackError) {
-        console.error("Claim rollback failed:", rollbackError.message);
+        console.error("Claim rollback failed.");
       }
     }
     // Handle duplicate active claims enforced by PostgreSQL.
@@ -264,7 +264,7 @@ router.post("/", authenticateToken, async (req, res) => {
       });
     }
 
-    console.error("Submit claim failed:", error.message);
+    console.error("Submit claim failed.");
 
     return res.status(500).json({
       error: "Unable to submit claim",
@@ -310,7 +310,7 @@ async function rollback(client) {
   try {
     await client.query("ROLLBACK");
   } catch (error) {
-    console.error("Claim workflow rollback failed:", error.message);
+    console.error("Claim workflow rollback failed.");
   }
 }
 
@@ -402,7 +402,7 @@ router.get("/review-queue", authenticateToken, async (req, res) => {
 
     return res.json({ count: result.rowCount, claims: result.rows });
   } catch (error) {
-    console.error("Get claim review queue failed:", error.message);
+    console.error("Get claim review queue failed.");
     return res.status(500).json({ error: "Unable to retrieve claim review queue" });
   }
 });
@@ -471,7 +471,7 @@ router.post("/:claimId/conversation/open", authenticateToken, async (req, res) =
     return res.json({ claimId: String(claimId), conversationStatus: "OPEN" });
   } catch (error) {
     await rollback(client);
-    console.error("Enable claim conversation failed:", error.message);
+    console.error("Enable claim conversation failed.");
     return res.status(500).json({ error: "Unable to enable chat for this claim" });
   } finally {
     client?.release();
@@ -500,7 +500,7 @@ router.get("/:claimId/verifications", authenticateToken, async (req, res) => {
     );
     return res.json({ count: result.rowCount, verifications: result.rows });
   } catch (error) {
-    console.error("Get claim verifications failed:", error.message);
+    console.error("Get claim verifications failed.");
     return res.status(500).json({ error: "Unable to retrieve claim verifications" });
   }
 });
@@ -620,7 +620,7 @@ router.post("/:claimId/verifications", authenticateToken, async (req, res) => {
     return res.status(201).json({ verification: inserted.rows[0] });
   } catch (error) {
     await rollback(client);
-    console.error("Record claim verification failed:", error.message);
+    console.error("Record claim verification failed.");
     return res.status(500).json({ error: "Unable to record claim verification" });
   } finally {
     if (client) client.release();
@@ -753,7 +753,7 @@ router.patch("/:claimId/review", authenticateToken, async (req, res) => {
     return res.json({ claim: updated.rows[0], matchStatus });
   } catch (error) {
     await rollback(client);
-    console.error("Review claim failed:", error.message);
+    console.error("Review claim failed.");
     return res.status(500).json({ error: "Unable to review claim" });
   } finally {
     if (client) client.release();
@@ -852,7 +852,7 @@ router.post("/:claimId/handover/code", authenticateToken, async (req, res) => {
     });
   } catch (error) {
     await rollback(client);
-    console.error("Issue handover code failed:", error.message);
+    console.error("Issue handover code failed.");
     return res.status(500).json({ error: "Unable to issue handover code" });
   } finally {
     if (client) client.release();
@@ -993,7 +993,7 @@ router.post("/:claimId/handover/confirm", authenticateToken, async (req, res) =>
     return res.json({ handover: handover.rows[0], claimStatus: "COMPLETED" });
   } catch (error) {
     await rollback(client);
-    console.error("Confirm handover failed:", error.message);
+    console.error("Confirm handover failed.");
     return res.status(500).json({ error: "Unable to confirm handover" });
   } finally {
     if (client) client.release();
@@ -1062,7 +1062,7 @@ router.get("/:claimId/photos", authenticateToken, async (req, res) => {
       })),
     });
   } catch (error) {
-    console.error("Get claim photo access failed:", error.message);
+    console.error("Get claim photo access failed.");
     return res.status(500).json({ error: "Unable to retrieve claim photo access" });
   }
 });
@@ -1133,7 +1133,7 @@ router.post("/:claimId/photo-sharing", authenticateToken, async (req, res) => {
     if (client) {
       try { await client.query("ROLLBACK"); } catch { /* retain original error */ }
     }
-    console.error("Grant claim photo access failed:", error.message);
+    console.error("Grant claim photo access failed.");
     return res.status(error.code === "23505" ? 409 : 500).json({ error: error.code === "23505" ? "Photos are already shared for this claim" : "Unable to share claim photos" });
   } finally {
     if (client) client.release();
@@ -1187,7 +1187,7 @@ router.delete("/:claimId/photo-sharing", authenticateToken, async (req, res) => 
     if (client) {
       try { await client.query("ROLLBACK"); } catch { /* retain original error */ }
     }
-    console.error("Revoke claim photo access failed:", error.message);
+    console.error("Revoke claim photo access failed.");
     return res.status(500).json({ error: "Unable to revoke claim photo access" });
   } finally {
     if (client) client.release();

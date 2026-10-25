@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   getNotifications,
   getUnreadNotificationCount,
@@ -7,6 +7,12 @@ import {
   markNotificationRead,
 } from '../api'
 import './NotificationCenter.css'
+import { startNotificationPolling } from '../notificationPolling'
+
+const configuredPollMs = Number(import.meta.env.VITE_NOTIFICATION_POLL_INTERVAL_MS)
+const NOTIFICATION_POLL_MS = Number.isInteger(configuredPollMs) && configuredPollMs >= 30000 && configuredPollMs <= 300000
+  ? configuredPollMs
+  : 60000
 
 const DESCRIPTIONS = {
   MATCH_FOUND: 'A new possible match is available for one of your lost reports.',
@@ -25,33 +31,45 @@ function NotificationCenter({ token }) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [clearing, setClearing] = useState(false)
+  const refreshInFlight = useRef(new Set())
+  const currentToken = useRef(token)
+  const mounted = useRef(false)
+
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
+  useEffect(() => { currentToken.current = token }, [token])
 
   const refresh = useCallback(async (includeList = open) => {
-    if (!token) return
+    if (!token || refreshInFlight.current.has(token)) return
+    refreshInFlight.current.add(token)
     try {
       const countResult = await getUnreadNotificationCount(token)
+      if (!mounted.current || currentToken.current !== token) return
       setUnreadCount(countResult.unreadCount)
       if (includeList) {
         setLoading(true)
         const listResult = await getNotifications(token)
+        if (!mounted.current || currentToken.current !== token) return
         setNotifications(listResult.notifications || [])
       }
       setError('')
     } catch (loadError) {
-      setError(loadError.message || 'Could not load notifications.')
+      if (mounted.current && currentToken.current === token) setError(loadError.message || 'Could not load notifications.')
     } finally {
-      setLoading(false)
+      if (mounted.current && currentToken.current === token) setLoading(false)
+      refreshInFlight.current.delete(token)
     }
   }, [token, open])
 
   useEffect(() => {
-    let active = true
-    getUnreadNotificationCount(token)
-      .then((result) => { if (active) setUnreadCount(result.unreadCount) })
-      .catch((loadError) => { if (active) setError(loadError.message || 'Could not load notifications.') })
-    return () => { active = false }
-  }, [token])
-  useEffect(() => {
+    const poller = startNotificationPolling(() => refresh(open), {
+      intervalMs: NOTIFICATION_POLL_MS,
+      isAuthenticated: () => Boolean(token),
+      isVisible: () => document.visibilityState === 'visible',
+    })
+    void poller.poll()
     const handleRefresh = () => refresh(open)
     const handleVisibility = () => {
       if (document.visibilityState === 'visible') handleRefresh()
@@ -63,8 +81,9 @@ function NotificationCenter({ token }) {
       window.removeEventListener('lostlink:notifications-refresh', handleRefresh)
       window.removeEventListener('focus', handleRefresh)
       document.removeEventListener('visibilitychange', handleVisibility)
+      poller.stop()
     }
-  }, [open, refresh])
+  }, [open, refresh, token])
 
   async function togglePanel() {
     const nextOpen = !open

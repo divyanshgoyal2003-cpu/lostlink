@@ -1,12 +1,14 @@
 const express = require("express");
-const jwt = require("jsonwebtoken");
 const pool = require("../config/db");
 const authenticateToken = require("../middleware/auth");
 const { createNotification } = require("../notifications");
 const { currentUser } = require("../authorityAccess");
 
 const router = express.Router();
-router.use(authenticateToken);
+router.use((req, res, next) => {
+  if (req.path.endsWith("/client-upload")) return next();
+  return authenticateToken(req, res, next);
+});
 
 function parseClaimId(value) {
   return /^[1-9]\d*$/.test(String(value || "")) ? String(value) : null;
@@ -117,7 +119,7 @@ router.get("/claims/:claimId", async (req, res) => {
       })),
     });
   } catch (error) {
-    console.error("Read claim conversation failed:", error.message);
+    console.error("Read claim conversation failed.");
     return res.status(500).json({ error: "Unable to load conversation" });
   }
 });
@@ -203,7 +205,7 @@ router.post("/claims/:claimId", async (req, res) => {
     if (client) {
       try { await client.query("ROLLBACK"); } catch { /* retain the original error */ }
     }
-    console.error("Send claim conversation message failed:", error.message);
+    console.error("Send claim conversation message failed.");
     return res.status(500).json({ error: "Unable to send message" });
   } finally {
     if (client) client.release();
@@ -211,10 +213,39 @@ router.post("/claims/:claimId", async (req, res) => {
 });
 
 const fs12 = require("node:fs/promises");
-const path12 = require("node:path");
 const crypto12 = require("node:crypto");
-const privateProofDir12 = path12.resolve(process.env.PRIVATE_PROOF_DIR || path12.join(__dirname, "../../private-proof-files"));
+const { putPrivateObject, getPrivateObject, getPrivateObjectStream, deletePrivateObject } = require("../storage/privateObjectStore");
+const { handlePrivateClientUpload, clientIntent } = require("../storage/clientUpload");
+const proofMaxBytes12 = Number(process.env.CHAT_PROOF_MAX_BYTES || 8 * 1024 * 1024);
 const proofCategories12 = new Set(["PURCHASE_RECEIPT","PRE_LOSS_PHOTO","DISTINGUISHING_MARK","PACKAGING_LABEL_SERIAL","OTHER"]);
+
+function actualProofType(bytes) {
+  if (!Buffer.isBuffer(bytes) || bytes.length < 8) return null;
+  if (bytes.subarray(0, 5).toString() === "%PDF-" && bytes.subarray(Math.max(0, bytes.length - 1024)).includes(Buffer.from("%%EOF"))) return "application/pdf";
+  if (bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255 && bytes.at(-2) === 255 && bytes.at(-1) === 217) return "image/jpeg";
+  if (bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10])) && bytes.length >= 57 && bytes.toString("ascii", bytes.length - 8, bytes.length - 4) === "IEND") return "image/png";
+  if (bytes.subarray(0, 4).toString() === "RIFF" && bytes.subarray(8, 12).toString() === "WEBP" && bytes.readUInt32LE(4) + 8 === bytes.length && ["VP8 ", "VP8L", "VP8X"].includes(bytes.subarray(12, 16).toString())) return "image/webp";
+  return null;
+}
+
+async function mayUploadProof(client, requestId, userId, lock = false) {
+  const query = await client.query(
+    `SELECT r.*,v.claim_id FROM conversation_proof_requests r JOIN conversations v USING(conversation_id)
+     WHERE proof_request_id=$1${lock ? " FOR UPDATE OF r" : ""}`,
+    [requestId]
+  );
+  if (!query.rowCount) return { status: 404 };
+  const request = query.rows[0];
+  const context = await loadContext(client, request.claim_id, userId, lock);
+  if (!context || context.side !== "CLAIMANT" || Number(request.recipient_user_id) !== Number(userId)) return { status: 403 };
+  if (!["OPEN", "NEEDS_MORE_INFORMATION"].includes(request.request_status)) return { status: 409 };
+  await client.query("SELECT pg_advisory_xact_lock(hashtext('proof-upload-rate:' || $1::text))", [userId]);
+  const rate = await client.query("SELECT COUNT(*)::int n FROM conversation_proof_attachments WHERE uploaded_by_user_id=$1 AND uploaded_at>NOW()-INTERVAL '1 hour'", [userId]);
+  if (rate.rows[0].n >= 20) return { status: 429 };
+  const previous = await client.query("SELECT storage_key FROM conversation_proof_attachments WHERE proof_request_id=$1", [requestId]);
+  if (previous.rowCount && request.request_status !== "NEEDS_MORE_INFORMATION") return { status: 409 };
+  return { status: 200, request, context, previous };
+}
 
 router.get("/inbox", async (req,res) => {
   try {
@@ -234,25 +265,7 @@ router.get("/inbox", async (req,res) => {
       conversations.push({claimId:+x.claim_id,itemTitle:x.title,participantType:c.side,counterpartName:counterpart,latestMessage:x.message_body||"",latestMessageAt:x.sent_at||x.created_at,unreadCount:x.unread});
     }
     res.json({conversations});
-  }catch(e){console.error("List conversation inbox failed:",e.message);res.status(500).json({error:"Unable to load conversations"});}
-});
-
-router.get("/claims/:claimId/events", async(req,res)=>{
-  const claimId=parseClaimId(req.params.claimId);if(!claimId)return res.status(400).json({error:"Invalid claim ID"});
-  const streamToken=req.headers.authorization?.slice(7);
-  try{
-    const initial=await loadContext(pool,claimId,req.user.userId);if(!initial)return res.status(403).json({error:"Conversation is not available to this account"});
-    res.set({"Content-Type":"text/event-stream","Cache-Control":"no-cache, no-transform","Connection":"keep-alive","X-Accel-Buffering":"no"});res.flushHeaders?.();
-    res.write("event: ready\ndata: {}\n\n");let previous="";
-    const timer=setInterval(async()=>{try{
-      jwt.verify(streamToken,process.env.JWT_SECRET);
-      const c=await loadContext(pool,claimId,req.user.userId);if(!c){res.write("event: revoked\ndata: {}\n\n");clearInterval(timer);return res.end();}
-      const q=await pool.query("SELECT (SELECT COALESCE(MAX(message_id),0)::text FROM messages WHERE conversation_id=$1) msg,(SELECT COALESCE(MAX(updated_at),'epoch'::timestamptz) FROM conversation_proof_requests WHERE conversation_id=$1) proof",[c.row.conversation_id]);
-      const key=q.rows[0].msg+":"+q.rows[0].proof.toISOString();
-      if(key!==previous){previous=key;res.write(`event: changed\ndata: ${JSON.stringify({claimId:+claimId})}\n\n`);}else res.write(": keepalive\n\n");
-    }catch{clearInterval(timer);res.end();}},1800);
-    req.on("close",()=>clearInterval(timer));
-  }catch(e){console.error("Conversation event stream failed:",e.message);if(!res.headersSent)res.status(500).json({error:"Unable to subscribe"});}
+  }catch(e){console.error("List conversation inbox failed.");res.status(500).json({error:"Unable to load conversations"});}
 });
 
 router.patch("/claims/:claimId/read",async(req,res)=>{
@@ -265,7 +278,7 @@ router.patch("/claims/:claimId/read",async(req,res)=>{
       ELSE GREATEST(COALESCE(conversation_read_states.last_read_message_id,0),EXCLUDED.last_read_message_id) END,read_at=NOW() RETURNING read_at`,
       [c.row.conversation_id,req.user.userId,msg]);
     if(!q.rowCount)return res.status(400).json({error:"Message not in this conversation"});res.json({readAt:q.rows[0].read_at});
-  }catch(e){console.error("Update chat read state failed:",e.message);res.status(500).json({error:"Unable to update read state"});}
+  }catch(e){console.error("Update chat read state failed.");res.status(500).json({error:"Unable to update read state"});}
 });
 
 router.post("/claims/:claimId/proof-requests",async(req,res)=>{
@@ -281,7 +294,7 @@ router.post("/claims/:claimId/proof-requests",async(req,res)=>{
     await createNotification(client,c.row.claimant_user_id,"PROOF_REQUESTED","PROOF_REQUEST",q.rows[0].proof_request_id);
     await client.query("INSERT INTO audit_logs(actor_user_id,action_type,entity_type,entity_id,metadata) VALUES($1,'CHAT_PROOF_REQUESTED','PROOF_REQUEST',$2,'{}')",[req.user.userId,q.rows[0].proof_request_id]);
     await client.query("COMMIT");res.status(201).json({proofRequest:q.rows[0]});
-  }catch(e){if(client)try{await client.query("ROLLBACK")}catch{}console.error("Create proof request failed:",e.message);res.status(500).json({error:"Unable to create proof request"});}finally{client?.release();}
+  }catch(e){if(client)try{await client.query("ROLLBACK")}catch{}console.error("Create proof request failed.");res.status(500).json({error:"Unable to create proof request"});}finally{client?.release();}
 });
 
 router.patch("/proof-requests/:requestId",async(req,res)=>{
@@ -299,14 +312,81 @@ router.patch("/proof-requests/:requestId",async(req,res)=>{
     await createNotification(client,r.recipient_user_id,nt,"PROOF_REQUEST",rid);
     await client.query("INSERT INTO audit_logs(actor_user_id,action_type,entity_type,entity_id,metadata) VALUES($1,$2,'PROOF_REQUEST',$3,'{}')",[req.user.userId,"CHAT_PROOF_"+status,rid]);
     await client.query("COMMIT");res.json({proofRequestId:+rid,status});
-  }catch(e){if(client)try{await client.query("ROLLBACK")}catch{}console.error("Review proof request failed:",e.message);res.status(500).json({error:"Unable to update proof request"});}finally{client?.release();}
+  }catch(e){if(client)try{await client.query("ROLLBACK")}catch{}console.error("Review proof request failed.");res.status(500).json({error:"Unable to update proof request"});}finally{client?.release();}
 });
 
-router.put("/proof-requests/:requestId/attachments",express.raw({type:["application/pdf","image/jpeg","image/png","image/webp"],limit:Number(process.env.CHAT_PROOF_MAX_BYTES||8*1024*1024)}),async(req,res)=>{
+router.post("/proof-requests/:requestId/attachments/client-upload", async (req, res) => {
+  const rid = parseClaimId(req.params.requestId);
+  const parsed = clientIntent(req);
+  if (!rid || !parsed) return res.status(parsed ? 400 : 401).json({ error: "Invalid or unauthenticated proof upload" });
+  const { intent } = parsed;
+  const contentTypes = ["application/pdf", "image/jpeg", "image/png", "image/webp"];
+  if (String(intent.requestId) !== rid || !/^[a-f0-9-]{36}$/.test(intent.storageKey || "") || !contentTypes.includes(intent.contentType) || typeof intent.note !== "string" || intent.note.length > 500) return res.status(400).json({ error: "Invalid proof upload request" });
+  const auth = await pool.connect();
+  try {
+    const request = await auth.query("SELECT r.request_status,r.recipient_user_id,v.claim_id FROM conversation_proof_requests r JOIN conversations v USING(conversation_id) WHERE r.proof_request_id=$1", [rid]);
+    const context = request.rowCount ? await loadContext(auth, request.rows[0].claim_id, parsed.userId) : null;
+    if (!context || context.side !== "CLAIMANT" || !request.rowCount || Number(request.rows[0].recipient_user_id) !== parsed.userId || !["OPEN", "NEEDS_MORE_INFORMATION"].includes(request.rows[0].request_status)) return res.status(403).json({ error: "Proof upload is not available to this account" });
+  } finally { auth.release(); }
+
+  return handlePrivateClientUpload(req, res, {
+    namespace: "proof-attachments",
+    allowedContentTypes: [intent.contentType],
+    maximumSizeInBytes: proofMaxBytes12,
+    getObjectName: (value) => value.storageKey,
+    authorize: async (userId, clientPayload) => {
+      if (String(clientPayload.requestId) !== rid || clientPayload.storageKey !== intent.storageKey || clientPayload.contentType !== intent.contentType) return null;
+      const client = await pool.connect();
+      try {
+        const request = await client.query("SELECT r.request_status,r.recipient_user_id,v.claim_id FROM conversation_proof_requests r JOIN conversations v USING(conversation_id) WHERE r.proof_request_id=$1", [rid]);
+        const context = request.rowCount ? await loadContext(client, request.rows[0].claim_id, userId) : null;
+        if (!context || context.side !== "CLAIMANT" || !request.rowCount || Number(request.rows[0].recipient_user_id) !== userId || !["OPEN", "NEEDS_MORE_INFORMATION"].includes(request.rows[0].request_status)) return null;
+        return { requestId: Number(rid), contentType: intent.contentType, note: intent.note };
+      } finally { client.release(); }
+    },
+    onCompleted: async (blob, trusted) => {
+      const objectName = trusted.objectName;
+      const object = await getPrivateObject("proof-attachments", objectName);
+      if (!object || blob.contentType !== trusted.contentType || object.bytes.length > proofMaxBytes12 || actualProofType(object.bytes) !== blob.contentType) {
+        await deletePrivateObject("proof-attachments", objectName).catch(() => {});
+        throw new Error("Proof content is invalid.");
+      }
+      let client;
+      let committed = false;
+      try {
+        client = await pool.connect(); await client.query("BEGIN");
+        await client.query("SELECT pg_advisory_xact_lock(hashtext('proof-blob-callback:' || $1::text))", [objectName]);
+        const duplicate = await client.query("SELECT 1 FROM conversation_proof_attachments WHERE storage_key=$1", [objectName]);
+        if (duplicate.rowCount) { await client.query("COMMIT"); committed = true; return; }
+        const allowed = await mayUploadProof(client, trusted.requestId, trusted.userId, true);
+        if (allowed.status !== 200) throw new Error("Proof upload authorization changed.");
+        const request = allowed.request;
+        await client.query(
+          `INSERT INTO conversation_proof_attachments(proof_request_id,conversation_id,uploaded_by_user_id,storage_key,content_type,byte_size,submission_note)
+           VALUES($1,$2,$3,$4,$5,$6,$7)`,
+          [trusted.requestId, request.conversation_id, trusted.userId, objectName, blob.contentType, object.bytes.length, trusted.note || null]
+        );
+        await client.query("UPDATE conversation_proof_requests SET request_status='SUBMITTED',updated_at=NOW() WHERE proof_request_id=$1", [trusted.requestId]);
+        await createNotification(client, request.requester_user_id, "PROOF_SUBMITTED", "PROOF_REQUEST", trusted.requestId);
+        await client.query("INSERT INTO audit_logs(actor_user_id,action_type,entity_type,entity_id,metadata) VALUES($1,'CHAT_PROOF_SUBMITTED','PROOF_REQUEST',$2,'{}')", [trusted.userId, trusted.requestId]);
+        await client.query("COMMIT"); committed = true;
+      } catch (error) {
+        if (client && !committed) await client.query("ROLLBACK").catch(() => {});
+        if (!committed) await deletePrivateObject("proof-attachments", objectName).catch(() => {});
+        throw error;
+      } finally { client?.release(); }
+    },
+  });
+});
+
+router.put("/proof-requests/:requestId/attachments", (req, res, next) => {
+  if (process.env.NODE_ENV === "production") return res.status(410).json({ error: "Use the private client upload flow" });
+  return express.raw({ type: ["application/pdf", "image/jpeg", "image/png", "image/webp"], limit: proofMaxBytes12 })(req, res, next);
+}, async(req,res)=>{
   const rid=parseClaimId(req.params.requestId),b=req.body;
-  let actual=null;if(Buffer.isBuffer(b)){if(b.subarray(0,5).toString()==="%PDF-")actual="application/pdf";else if(b[0]===255&&b[1]===216&&b[2]===255)actual="image/jpeg";else if(b.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10])))actual="image/png";else if(b.subarray(0,4).toString()==="RIFF"&&b.subarray(8,12).toString()==="WEBP")actual="image/webp";}
+  const actual=actualProofType(b);
   if(!rid||!Buffer.isBuffer(b)||!b.length||!actual||actual!==req.headers["content-type"])return res.status(400).json({error:"Unsupported, invalid, or empty proof file"});
-  let client,filePath;try{client=await pool.connect();await client.query("BEGIN");
+  let client,storageKey,stored=false,committed=false;try{client=await pool.connect();await client.query("BEGIN");
     const q=await client.query("SELECT r.*,v.claim_id FROM conversation_proof_requests r JOIN conversations v USING(conversation_id) WHERE proof_request_id=$1 FOR UPDATE OF r",[rid]);
     if(!q.rowCount){await client.query("ROLLBACK");return res.status(404).json({error:"Proof request not found"});}
     const r=q.rows[0],c=await loadContext(client,r.claim_id,req.user.userId,true);
@@ -317,14 +397,14 @@ router.put("/proof-requests/:requestId/attachments",express.raw({type:["applicat
     if(rate.rows[0].n>=20){await client.query("ROLLBACK");return res.status(429).json({error:"Proof upload rate limit reached"});}
     const previous=await client.query("SELECT 1 FROM conversation_proof_attachments WHERE proof_request_id=$1",[rid]);
     if(previous.rowCount&&r.request_status!=="NEEDS_MORE_INFORMATION"){await client.query("ROLLBACK");return res.status(409).json({error:"Proof already submitted"});}
-    const key=crypto12.randomUUID();await fs12.mkdir(privateProofDir12,{recursive:true,mode:0o700});filePath=path12.join(privateProofDir12,key);await fs12.writeFile(filePath,b,{flag:"wx",mode:0o600});
+    const key=crypto12.randomUUID();storageKey=key;await putPrivateObject("proof-attachments",key,b,actual);stored=true;
     const note=String(req.headers["x-proof-note"]||"").slice(0,500)||null;
     const a=await client.query("INSERT INTO conversation_proof_attachments(proof_request_id,conversation_id,uploaded_by_user_id,storage_key,content_type,byte_size,submission_note) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING proof_attachment_id,content_type,byte_size,uploaded_at,submission_note",[rid,r.conversation_id,req.user.userId,key,actual,b.length,note]);
     await client.query("UPDATE conversation_proof_requests SET request_status='SUBMITTED',updated_at=NOW() WHERE proof_request_id=$1",[rid]);
     await createNotification(client,r.requester_user_id,"PROOF_SUBMITTED","PROOF_REQUEST",rid);
     await client.query("INSERT INTO audit_logs(actor_user_id,action_type,entity_type,entity_id,metadata) VALUES($1,'CHAT_PROOF_SUBMITTED','PROOF_REQUEST',$2,'{}')",[req.user.userId,rid]);
-    await client.query("COMMIT");res.status(201).json({attachment:{attachmentId:+a.rows[0].proof_attachment_id,contentType:actual,byteSize:b.length,uploadedAt:a.rows[0].uploaded_at,note}});
-  }catch(e){if(client)try{await client.query("ROLLBACK")}catch{}if(filePath)try{await fs12.unlink(filePath)}catch{}console.error("Upload chat proof failed:",e.message);res.status(500).json({error:"Unable to upload proof"});}finally{client?.release();}
+    await client.query("COMMIT");committed=true;res.status(201).json({attachment:{attachmentId:+a.rows[0].proof_attachment_id,contentType:actual,byteSize:b.length,uploadedAt:a.rows[0].uploaded_at,note}});
+  }catch(e){if(client&&!committed)try{await client.query("ROLLBACK")}catch{}if(stored&&!committed)await deletePrivateObject("proof-attachments",storageKey).catch(()=>{});console.error("Upload chat proof failed.");res.status(500).json({error:"Unable to upload proof"});}finally{client?.release();}
 });
 
 router.get("/proof-attachments/:attachmentId/content",async(req,res)=>{
@@ -333,9 +413,10 @@ router.get("/proof-attachments/:attachmentId/content",async(req,res)=>{
   if(!q.rowCount)return res.status(404).json({error:"Attachment not found"});const r=q.rows[0],c=await loadContext(pool,r.claim_id,req.user.userId);
   const allowed=c&&(+r.recipient_user_id===+req.user.userId||(+r.requester_user_id===+req.user.userId&&["FINDER","AUTHORITY"].includes(c.side)));
   if(!allowed)return res.status(403).json({error:"Attachment unavailable"});
-  const file=path12.resolve(privateProofDir12,r.storage_key);if(!file.startsWith(privateProofDir12+path12.sep))return res.status(404).json({error:"Attachment not found"});
-  const bytes=await fs12.readFile(file);res.set({"Content-Type":r.content_type,"Content-Length":String(r.byte_size),"Content-Disposition":"attachment","X-Content-Type-Options":"nosniff","Cache-Control":"private, no-store"});res.send(bytes);
- }catch(e){console.error("Retrieve chat proof failed:",e.message);res.status(404).json({error:"Attachment unavailable"});}
+  const object=await getPrivateObjectStream("proof-attachments",r.storage_key);if(!object)return res.status(404).json({error:"Attachment not found"});
+  res.set({"Content-Type":r.content_type,"Content-Length":String(r.byte_size),"Content-Disposition":"attachment","X-Content-Type-Options":"nosniff","Cache-Control":"private, no-store"});
+  object.stream.on("error",()=>{if(!res.headersSent)res.status(404).end();else res.destroy();});object.stream.pipe(res);
+ }catch(e){console.error("Retrieve chat proof failed.");res.status(404).json({error:"Attachment unavailable"});}
 });
 
 router.use((error, req, res, next) => {

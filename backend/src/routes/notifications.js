@@ -67,7 +67,7 @@ router.get("/unread-count", async (req, res) => {
     )
     return res.json({ unreadCount: result.rows[0].count })
   } catch (error) {
-    console.error("Get unread notification count failed:", error.message)
+    console.error("Get unread notification count failed.")
     return res.status(500).json({ error: "Unable to retrieve notifications" })
   }
 })
@@ -91,7 +91,7 @@ router.get("/", async (req, res) => {
     )
     return res.json({ notifications: result.rows, limit, offset })
   } catch (error) {
-    console.error("List notifications failed:", error.message)
+    console.error("List notifications failed.")
     return res.status(500).json({ error: "Unable to retrieve notifications" })
   }
 })
@@ -111,7 +111,7 @@ router.patch("/:notificationId/read", async (req, res) => {
     if (!result.rowCount) return res.status(404).json({ error: "Notification not found" })
     return res.json({ notification: result.rows[0] })
   } catch (error) {
-    console.error("Mark notification read failed:", error.message)
+    console.error("Mark notification read failed.")
     return res.status(500).json({ error: "Unable to update notification" })
   }
 })
@@ -125,7 +125,7 @@ router.post("/read-all", async (req, res) => {
     )
     return res.json({ updatedCount: result.rowCount })
   } catch (error) {
-    console.error("Mark all notifications read failed:", error.message)
+    console.error("Mark all notifications read failed.")
     return res.status(500).json({ error: "Unable to update notifications" })
   }
 })
@@ -138,7 +138,7 @@ router.delete("/", async (req, res) => {
     )
     return res.json({ deletedCount: result.rowCount })
   } catch (error) {
-    console.error("Clear notifications failed:", error.message)
+    console.error("Clear notifications failed.")
     return res.status(500).json({ error: "Unable to clear notifications" })
   }
 })

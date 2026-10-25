@@ -1,5 +1,20 @@
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api'
+import { upload as uploadPrivateBlob } from '@vercel/blob/client'
+import { resolveApiBaseUrl } from './apiBaseUrl'
+
+const API_BASE_URL = resolveApiBaseUrl(import.meta.env.VITE_API_URL, import.meta.env.PROD)
+
+async function uploadToPrivateBlob(token, endpoint, namespace, objectName, file, payload) {
+  await uploadPrivateBlob(`lostlink/${namespace}/${objectName}`, file, {
+    access: 'private',
+    contentType: file.type,
+    handleUploadUrl: `${API_BASE_URL}${endpoint}`,
+    clientPayload: JSON.stringify({ token, ...payload, storageKey: objectName, contentType: file.type }),
+    multipart: file.size > 4 * 1024 * 1024,
+  })
+}
+
+const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
 
 export async function apiRequest(path, options = {}) {
   const response = await fetch(`${API_BASE_URL}${path}`, {
@@ -114,7 +129,23 @@ export async function createProofRequest(token, claimId, request) {
 export async function reviewProofRequest(token, requestId, status) {
   return authenticatedRequest(`/conversations/proof-requests/${encodeURIComponent(requestId)}`, token, { method: 'PATCH', body: JSON.stringify({ status }) })
 }
-export async function uploadConversationProof(token, requestId, file, note = '') {
+export async function uploadConversationProof(token, requestId, file, note = '', claimId = null) {
+  if (import.meta.env.PROD) {
+    const previous = claimId ? await getClaimConversation(token, claimId) : null
+    const previousCount = previous?.proofRequests?.find((request) => String(request.requestId) === String(requestId))?.attachments?.length || 0
+    const storageKey = crypto.randomUUID()
+    await uploadToPrivateBlob(token, `/conversations/proof-requests/${encodeURIComponent(requestId)}/attachments/client-upload`, 'proof-attachments', storageKey, file, { requestId: String(requestId), note })
+    if (claimId) {
+      for (let attempt = 0; attempt < 12; attempt += 1) {
+        const latest = await getClaimConversation(token, claimId)
+        const currentCount = latest.proofRequests?.find((request) => String(request.requestId) === String(requestId))?.attachments?.length || 0
+        if (currentCount > previousCount) break
+        if (attempt === 11) throw new Error('The upload reached private storage, but its secure record is still processing. Refresh the conversation shortly.')
+        await sleep(500)
+      }
+    }
+    return { uploaded: true }
+  }
   return authenticatedRequest(`/conversations/proof-requests/${encodeURIComponent(requestId)}/attachments`, token, { method: 'PUT', headers: { 'Content-Type': file.type, 'X-Proof-Note': note }, body: file })
 }
 export async function downloadConversationProof(token, attachmentId) {
@@ -282,6 +313,21 @@ export async function confirmHandover(token, claimId, code) {
 }
 
 export async function uploadFoundReportPhoto(token, reportId, photoType, file) {
+  if (import.meta.env.PROD) {
+    const previous = await getFoundReportPhotos(token, reportId)
+    const previousPhoto = (previous.photos || []).find((entry) => entry.photoType === photoType)
+    const extension = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp' }[file.type]
+    if (!extension) throw new Error('Choose a JPEG, PNG, or WebP image.')
+    const storageKey = `${crypto.randomUUID()}${extension}`
+    await uploadToPrivateBlob(token, `/reports/${encodeURIComponent(reportId)}/photos/client-upload`, 'item-photos', storageKey, file, { reportId: String(reportId), photoType })
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      const listing = await getFoundReportPhotos(token, reportId)
+      const photo = (listing.photos || []).find((entry) => entry.photoType === photoType)
+      if (photo && photo.uploadedAt !== previousPhoto?.uploadedAt) return { photo }
+      if (attempt === 11) throw new Error('The upload reached private storage, but its secure record is still processing. Refresh the report shortly.')
+      await sleep(500)
+    }
+  }
   return authenticatedRequest(`/reports/${reportId}/photos`, token, {
     method: 'PUT',
     headers: { 'Content-Type': file.type, 'X-Photo-Type': photoType },

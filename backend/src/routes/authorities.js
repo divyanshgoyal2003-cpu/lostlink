@@ -79,7 +79,7 @@ router.get("/destinations", async (_req, res) => {
     );
     return res.json({ destinations: result.rows });
   } catch (error) {
-    console.error("List authority destinations failed:", error.message);
+    console.error("List authority destinations failed.");
     return res.status(500).json({ error: "Unable to retrieve authority destinations" });
   }
 });
@@ -154,7 +154,7 @@ router.post("/admin/accounts", async (req, res) => {
   } catch (error) {
     await rollback(client);
     if (error.code === "23505") return res.status(409).json({ error: "An account or authority with those details already exists" });
-    console.error("Provision authority account failed:", error.message);
+    console.error("Provision authority account failed.");
     return res.status(500).json({ error: "Unable to provision authority account" });
   } finally {
     if (client) client.release();
@@ -173,7 +173,7 @@ router.get("/me", async (req, res) => {
     );
     return res.json({ memberships: result.rows });
   } catch (error) {
-    console.error("Get authority memberships failed:", error.message);
+    console.error("Get authority memberships failed.");
     return res.status(500).json({ error: "Unable to retrieve authority memberships" });
   }
 });
@@ -202,7 +202,7 @@ router.get("/admin/queue", async (req, res) => {
     ]);
     return res.json({ destinations: destinations.rows, memberships: memberships.rows });
   } catch (error) {
-    console.error("Get authority admin queue failed:", error.message);
+    console.error("Get authority admin queue failed.");
     return res.status(500).json({ error: "Unable to retrieve authority approval queue" });
   }
 });
@@ -255,7 +255,7 @@ router.patch("/admin/destinations/:authorityId", async (req, res) => {
     return res.json({ destination: updated.rows[0] });
   } catch (error) {
     await rollback(client);
-    console.error("Update authority destination failed:", error.message);
+    console.error("Update authority destination failed.");
     return res.status(500).json({ error: "Unable to update authority destination" });
   } finally {
     if (client) client.release();
@@ -334,7 +334,7 @@ router.patch("/admin/memberships/:membershipId", async (req, res) => {
     return res.json({ membership: updated.rows[0] });
   } catch (error) {
     await rollback(client);
-    console.error("Update authority membership failed:", error.message);
+    console.error("Update authority membership failed.");
     return res.status(500).json({ error: "Unable to update authority membership" });
   } finally {
     if (client) client.release();
@@ -423,7 +423,7 @@ router.patch("/reports/:reportId/assignment", async (req, res) => {
     return res.json({ report: updated.rows[0] });
   } catch (error) {
     await rollback(client);
-    console.error("Update report recovery assignment failed:", error.message);
+    console.error("Update report recovery assignment failed.");
     return res.status(error.code === "23514" ? 400 : 500).json({ error: error.code === "23514" ? "Authority destination is no longer eligible" : "Unable to update report assignment" });
   } finally {
     if (client) client.release();
@@ -509,7 +509,7 @@ router.post("/reports/:reportId/custody-transfers", async (req, res) => {
     return res.status(201).json({ custodyTransfer: transfer, code });
   } catch (error) {
     await rollback(client);
-    console.error("Initiate authority custody transfer failed:", error.message);
+    console.error("Initiate authority custody transfer failed.");
     return res.status(error.code === "23505" ? 409 : error.code === "23514" ? 409 : 500).json({ error: ["23505", "23514"].includes(error.code) ? "Custody transfer is no longer eligible" : "Unable to initiate custody transfer" });
   } finally {
     if (client) client.release();
@@ -577,7 +577,7 @@ router.get("/cases", async (req, res) => {
     );
     return res.json({ cases: result.rows });
   } catch (error) {
-    console.error("List authority cases failed:", error.message);
+    console.error("List authority cases failed.");
     return res.status(500).json({ error: "Unable to retrieve authority cases" });
   }
 });
@@ -625,7 +625,7 @@ router.get("/cases/:reportId", async (req, res) => {
       : { rows: [] };
     return res.json({ case: result.rows[0], claims: claims.rows });
   } catch (error) {
-    console.error("Get authority case failed:", error.message);
+    console.error("Get authority case failed.");
     return res.status(500).json({ error: "Unable to retrieve authority case" });
   }
 });
@@ -718,7 +718,7 @@ router.post("/custody-transfers/:transferId/confirm", async (req, res) => {
     return res.json({ custodyTransfer: received.rows[0] });
   } catch (error) {
     await rollback(client);
-    console.error("Confirm authority custody failed:", error.message);
+    console.error("Confirm authority custody failed.");
     return res.status(error.code === "23514" ? 409 : 500).json({ error: error.code === "23514" ? "Custody confirmation is no longer allowed" : "Unable to confirm custody" });
   } finally {
     if (client) client.release();
@@ -766,7 +766,7 @@ router.post("/custody-transfers/:transferId/cancel", async (req, res) => {
     return res.json({ custodyTransferId: Number(transferId), custodyStatus: "CANCELLED" });
   } catch (error) {
     await rollback(client);
-    console.error("Cancel custody transfer failed:", error.message);
+    console.error("Cancel custody transfer failed.");
     return res.status(500).json({ error: "Unable to cancel custody transfer" });
   } finally {
     if (client) client.release();

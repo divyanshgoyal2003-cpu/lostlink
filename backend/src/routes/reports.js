@@ -1,17 +1,14 @@
 
 const express = require("express");
 const crypto = require("node:crypto");
-const fs = require("node:fs/promises");
-const path = require("node:path");
 const pool = require("../config/db");
+const { putPrivateObject, getPrivateObject, getPrivateObjectStream, deletePrivateObject } = require("../storage/privateObjectStore");
+const { handlePrivateClientUpload, clientIntent } = require("../storage/clientUpload");
 const authenticateToken = require("../middleware/auth");
 const { createNotification } = require("../notifications");
 const { currentUser, hasActiveAuthorityMembership } = require("../authorityAccess");
 
 const router = express.Router();
-const PRIVATE_PHOTO_DIR = path.resolve(
-  process.env.PRIVATE_PHOTO_DIR || path.join(__dirname, "../../private-photos")
-);
 const PHOTO_MAX_BYTES = 8 * 1024 * 1024;
 const PHOTO_TYPES = new Set(["FRONT", "BACK", "SIDE", "DISTINGUISHING_DETAIL"]);
 
@@ -116,12 +113,7 @@ function photoMetadata(row) {
 }
 
 async function removePrivatePhoto(storageKey) {
-  if (typeof storageKey !== "string" || !/^[a-f0-9-]+\.(jpg|png|webp)$/.test(storageKey)) return;
-  try {
-    await fs.unlink(path.join(PRIVATE_PHOTO_DIR, storageKey));
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-  }
+  await deletePrivateObject("item-photos", storageKey);
 }
 
 function validatePhoto(contentType, bytes) {
@@ -140,10 +132,99 @@ function parsePrivatePhotoBody(req, res, next) {
   });
 }
 
+router.post("/:id/photos/client-upload", async (req, res) => {
+  const reportId = req.params.id;
+  if (!/^[1-9]\d*$/.test(reportId) || !Number.isSafeInteger(Number(reportId))) return res.status(400).json({ error: "Invalid report ID" });
+  const parsed = clientIntent(req);
+  if (!parsed) return res.status(401).json({ error: "Authentication required" });
+  const { intent } = parsed;
+  if (String(intent.reportId) !== reportId || !PHOTO_TYPES.has(intent.photoType) || typeof intent.storageKey !== "string") return res.status(400).json({ error: "Invalid photo upload request" });
+  const ext = intent.storageKey.slice(intent.storageKey.lastIndexOf("."));
+  const expectedType = ext === ".jpg" ? "image/jpeg" : ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : null;
+  if (!/^[a-f0-9-]{36}\.(jpg|png|webp)$/.test(intent.storageKey) || !expectedType || intent.contentType !== expectedType) return res.status(400).json({ error: "Invalid photo upload request" });
+
+  return handlePrivateClientUpload(req, res, {
+    namespace: "item-photos",
+    allowedContentTypes: [expectedType],
+    maximumSizeInBytes: PHOTO_MAX_BYTES,
+    getObjectName: (value) => value.storageKey,
+    authorize: async (userId, clientIntentValue) => {
+      if (String(clientIntentValue.reportId) !== reportId || clientIntentValue.photoType !== intent.photoType || clientIntentValue.storageKey !== intent.storageKey || clientIntentValue.contentType !== expectedType) return null;
+      const owner = await pool.query(
+        `SELECT 1 FROM reports r JOIN users u ON u.user_id=r.user_id
+         WHERE r.report_id=$1 AND r.user_id=$2 AND r.report_type='FOUND'
+           AND r.status='OPEN' AND u.account_status='ACTIVE'`,
+        [reportId, userId]
+      );
+      return owner.rowCount ? { reportId: Number(reportId), photoType: intent.photoType, contentType: expectedType } : null;
+    },
+    onCompleted: async (blob, trusted) => {
+      const objectName = trusted.objectName;
+      const object = await getPrivateObject("item-photos", objectName);
+      const format = object && blob.contentType === trusted.contentType ? validatePhoto(blob.contentType, object.bytes) : null;
+      if (!format) {
+        await deletePrivateObject("item-photos", objectName).catch(() => {});
+        throw new Error("Photo content is invalid.");
+      }
+      let client;
+      let oldKey = null;
+      let committed = false;
+      try {
+        client = await pool.connect();
+        await client.query("BEGIN");
+        const report = await client.query(
+          `SELECT r.item_id FROM reports r JOIN users u ON u.user_id=r.user_id
+           WHERE r.report_id=$1 AND r.user_id=$2 AND r.report_type='FOUND'
+             AND r.status='OPEN' AND u.account_status='ACTIVE' FOR UPDATE OF r`,
+          [trusted.reportId, trusted.userId]
+        );
+        if (!report.rowCount) throw new Error("Report authorization changed.");
+        const itemId = report.rows[0].item_id;
+        const existing = await client.query(
+          `SELECT photo_id, storage_key FROM item_photos
+           WHERE item_id=$1 AND photo_type=$2 ORDER BY uploaded_at DESC, photo_id DESC LIMIT 1 FOR UPDATE`,
+          [itemId, trusted.photoType]
+        );
+        if (existing.rowCount && existing.rows[0].storage_key === objectName) {
+          await client.query("COMMIT"); committed = true; return;
+        }
+        if (existing.rowCount) {
+          oldKey = existing.rows[0].storage_key;
+          await client.query("UPDATE item_photos SET storage_key=$2, uploaded_at=NOW() WHERE photo_id=$1", [existing.rows[0].photo_id, objectName]);
+        } else {
+          await client.query("INSERT INTO item_photos(item_id,storage_key,photo_type) VALUES($1,$2,$3)", [itemId, objectName, trusted.photoType]);
+        }
+        await client.query("COMMIT"); committed = true;
+      } catch (error) {
+        if (client && !committed) await client.query("ROLLBACK").catch(() => {});
+        if (!committed) await deletePrivateObject("item-photos", objectName).catch(() => {});
+        throw error;
+      } finally { client?.release(); }
+      if (oldKey) await deletePrivateObject("item-photos", oldKey).catch(() => console.error("Unable to remove replaced private photo."));
+    },
+  });
+});
+
 // Photo bytes are accepted as a raw image body, never as a public/object URL.
 router.put(
   "/:id/photos",
   authenticateToken,
+  (req, res, next) => {
+    if (process.env.NODE_ENV === "production") return res.status(410).json({ error: "Use the private client upload flow" });
+    return next();
+  },
+  async (req, res, next) => {
+    if (!/^[1-9]\d*$/.test(req.params.id) || !Number.isSafeInteger(Number(req.params.id))) return res.status(400).json({ error: "Invalid report ID" });
+    try {
+      const owner = await pool.query(
+        `SELECT 1 FROM reports r JOIN users u ON u.user_id=r.user_id
+         WHERE r.report_id=$1 AND r.user_id=$2 AND r.report_type='FOUND'
+           AND r.status='OPEN' AND u.account_status='ACTIVE'`,
+        [req.params.id, req.user.userId]
+      );
+      return owner.rowCount ? next() : res.status(404).json({ error: "Open found report not found" });
+    } catch { return res.status(500).json({ error: "Unable to authorize photo upload" }); }
+  },
   parsePrivatePhotoBody,
   async (req, res) => {
     const reportId = req.params.id;
@@ -179,8 +260,7 @@ router.put(
         return res.status(404).json({ error: "Open found report not found" });
       }
 
-      await fs.mkdir(PRIVATE_PHOTO_DIR, { recursive: true });
-      await fs.writeFile(path.join(PRIVATE_PHOTO_DIR, storageKey), req.body, { flag: "wx", mode: 0o600 });
+      await putPrivateObject("item-photos", storageKey, req.body, req.get("Content-Type")?.split(";")[0]);
       savedFile = true;
 
       const itemId = report.rows[0].item_id;
@@ -206,7 +286,7 @@ router.put(
       }
       await client.query("COMMIT");
       savedFile = false;
-      if (existing.rowCount) await removePrivatePhoto(existing.rows[0].storage_key);
+      if (existing.rowCount) await removePrivatePhoto(existing.rows[0].storage_key).catch(() => console.error("Unable to remove replaced private photo."));
       return res.status(existing.rowCount ? 200 : 201).json({ photo: photoMetadata(result.rows[0]) });
     } catch (error) {
       if (client) {
@@ -215,7 +295,7 @@ router.put(
       if (savedFile) {
         try { await removePrivatePhoto(storageKey); } catch { /* orphan cleanup can be retried */ }
       }
-      console.error("Upload found report photo failed:", error.message);
+      console.error("Upload found report photo failed.");
       return res.status(500).json({ error: "Unable to save report photo" });
     } finally {
       if (client) client.release();
@@ -246,7 +326,7 @@ router.get("/:id/photos", authenticateToken, async (req, res) => {
     }
     return res.json({ photos: result.rows.map(photoMetadata) });
   } catch (error) {
-    console.error("List found report photos failed:", error.message);
+    console.error("List found report photos failed.");
     return res.status(500).json({ error: "Unable to list report photos" });
   }
 });
@@ -314,22 +394,22 @@ router.get("/photos/:photoId", authenticateToken, async (req, res) => {
     }
     if (!selected) return res.status(403).json({ error: "You are not authorized to view this photo" });
 
-    const resolved = path.resolve(PRIVATE_PHOTO_DIR, selected.storage_key);
-    if (path.dirname(resolved) !== PRIVATE_PHOTO_DIR) return res.status(404).json({ error: "Photo not found" });
-    const bytes = await fs.readFile(resolved);
-    const extension = path.extname(selected.storage_key);
+    const object = await getPrivateObjectStream("item-photos", selected.storage_key);
+    if (!object) return res.status(404).json({ error: "Photo not found" });
+    const extension = selected.storage_key.slice(selected.storage_key.lastIndexOf("."));
     const contentType = extension === ".jpg" ? "image/jpeg" : extension === ".png" ? "image/png" : "image/webp";
     res.set({
       "Content-Type": contentType,
-      "Content-Length": String(bytes.length),
+      ...(object.contentLength ? { "Content-Length": String(object.contentLength) } : {}),
       "Content-Disposition": "inline",
       "X-Content-Type-Options": "nosniff",
       "Cache-Control": "private, no-store",
     });
-    return res.send(bytes);
+    object.stream.on("error", () => { if (!res.headersSent) res.status(404).end(); else res.destroy(); });
+    return object.stream.pipe(res);
   } catch (error) {
-    if (error.code === "ENOENT") return res.status(404).json({ error: "Photo not found" });
-    console.error("Retrieve private photo failed:", error.message);
+    if (error.code === "ENOENT" || error.code === "BLOB_NOT_FOUND") return res.status(404).json({ error: "Photo not found" });
+    console.error("Retrieve private photo failed.");
     return res.status(500).json({ error: "Unable to retrieve photo" });
   }
 });
@@ -651,10 +731,10 @@ if (
     try {
       await client.query("ROLLBACK");
     } catch (rollbackError) {
-      console.error("Report transaction rollback failed:", rollbackError.message);
+      console.error("Report transaction rollback failed.");
     }
 
-    console.error("Create report failed:", error.message);
+    console.error("Create report failed.");
 
     return res.status(error.code === "23514" ? 400 : 500).json({
       error: error.code === "23514" ? "Authority destination is no longer eligible" : "Unable to create report",
@@ -679,7 +759,7 @@ router.get("/mine/history", authenticateToken, async (req, res) => {
     );
     return res.json({ count: result.rowCount, reports: result.rows });
   } catch (error) {
-    console.error("Get returned report history failed:", error.message);
+    console.error("Get returned report history failed.");
     return res.status(500).json({ error: "Unable to retrieve return history" });
   }
 });
@@ -734,7 +814,7 @@ router.get("/mine", authenticateToken, async (req, res) => {
       reports: result.rows,
     });
   } catch (error) {
-    console.error("Get own reports failed:", error.message);
+    console.error("Get own reports failed.");
 
     return res.status(500).json({
       error: "Unable to retrieve your reports",
@@ -878,10 +958,10 @@ router.patch("/:id", authenticateToken, async (req, res) => {
     try {
       await client.query("ROLLBACK");
     } catch (rollbackError) {
-      console.error("Update rollback failed:", rollbackError.message);
+      console.error("Update rollback failed.");
     }
 
-    console.error("Update report failed:", error.message);
+    console.error("Update report failed.");
 
     return res.status(500).json({
       error: "Unable to update report",
@@ -939,7 +1019,7 @@ router.patch("/:id/close", authenticateToken, async (req, res) => {
     return res.json({ message: "Report closed successfully", report: updated.rows[0] });
   } catch (error) {
     try { await client.query("ROLLBACK"); } catch { /* retain original error */ }
-    console.error("Close report failed:", error.message);
+    console.error("Close report failed.");
     return res.status(500).json({
       error: "Unable to close report",
     });

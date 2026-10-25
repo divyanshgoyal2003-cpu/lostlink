@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { createProofRequest, downloadConversationProof, getClaimConversation, markConversationRead, reviewProofRequest, sendClaimConversationMessage, uploadConversationProof } from '../api'
+import { startConversationPolling } from '../conversationPolling'
 import './ConversationPanel.css'
 
 function ConversationPanel({ token, claimId, title = 'Conversation' }) {
@@ -15,6 +16,7 @@ function ConversationPanel({ token, claimId, title = 'Conversation' }) {
   const [uploading, setUploading] = useState('')
   const [hasMore, setHasMore] = useState(false)
   const [pendingMessageId, setPendingMessageId] = useState('')
+  const lastReadMessageId = useRef('')
 
   const load = useCallback(async () => {
     if (!token || !claimId) return
@@ -25,45 +27,25 @@ function ConversationPanel({ token, claimId, title = 'Conversation' }) {
       setProofRequests(result.proofRequests || [])
       setCanRequestProof(Boolean(result.canRequestProof))
       const last = result.messages?.at(-1)
-      if (last) await markConversationRead(token, claimId, last.messageId).catch(() => {})
+      const readKey = last ? `${claimId}:${last.messageId}` : ''
+      if (last && readKey !== lastReadMessageId.current) {
+        lastReadMessageId.current = readKey
+        await markConversationRead(token, claimId, last.messageId).catch(() => {})
+      }
+      return true
     } catch (loadError) {
       setError(loadError.message || 'Conversation is not available.')
+      return loadError.status !== 401 && loadError.status !== 403
     } finally {
       setLoading(false)
     }
   }, [token, claimId])
 
   useEffect(() => {
-    void load()
-  }, [load])
-
-  useEffect(() => {
     if (!token || !claimId) return undefined
-    const controller = new AbortController()
-    let buffer = ''
-    async function subscribe() {
-      try {
-        const response = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:5000/api'}/conversations/claims/${encodeURIComponent(claimId)}/events`, {
-          headers: { Authorization: `Bearer ${token}` }, signal: controller.signal,
-        })
-        if (!response.ok || !response.body) return
-        const reader = response.body.getReader()
-        const decoder = new TextDecoder()
-        while (true) {
-          const { value, done } = await reader.read()
-          if (done) break
-          buffer += decoder.decode(value, { stream: true })
-          const events = buffer.split('\n\n')
-          buffer = events.pop() || ''
-          if (events.some((event) => event.startsWith('event: changed'))) void load()
-          if (events.some((event) => event.startsWith('event: revoked'))) { setError('This conversation is no longer available.'); break }
-        }
-      } catch (streamError) {
-        if (streamError.name !== 'AbortError') setTimeout(() => { if (!controller.signal.aborted) void subscribe() }, 2500)
-      }
-    }
-    void subscribe()
-    return () => controller.abort()
+    const poller = startConversationPolling(load, { intervalMs: 5000 })
+    void poller.poll()
+    return () => poller.stop()
   }, [load, token, claimId])
 
   async function send(event) {
@@ -110,7 +92,7 @@ function ConversationPanel({ token, claimId, title = 'Conversation' }) {
   async function submitProof(requestId, file) {
     if (!file) return
     setUploading(String(requestId)); setError('')
-    try { await uploadConversationProof(token, requestId, file); await load() }
+    try { await uploadConversationProof(token, requestId, file, '', claimId); await load() }
     catch (uploadError) { setError(uploadError.message || 'Could not upload proof.') }
     finally { setUploading('') }
   }

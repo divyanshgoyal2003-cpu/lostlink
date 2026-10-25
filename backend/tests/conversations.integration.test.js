@@ -66,7 +66,6 @@ after(async () => {
 test('conversation membership, idempotent messages, read cursors, and private proof lifecycle', async () => {
   assert.equal((await api('/api/conversations/inbox')).status, 401)
   assert.equal((await api(`/api/conversations/claims/${claimId}`, { token: stranger.token })).status, 403)
-  assert.equal((await api(`/api/conversations/claims/${claimId}/events`, { token: stranger.token })).status, 403)
   assert.equal((await api(`/api/conversations/claims/${claimId}`, { token: finder.token })).status, 200)
   const initial = await api(`/api/conversations/claims/${claimId}`, { token: claimant.token })
   assert.equal(initial.status, 200)
@@ -88,7 +87,7 @@ test('conversation membership, idempotent messages, read cursors, and private pr
   assert.equal((await api(`/api/conversations/proof-requests/${request.proof_request_id}`, { token: stranger.token, method: 'PATCH', body: JSON.stringify({ status: 'ACCEPTED' }) })).status, 403)
   const invalid = await api(`/api/conversations/proof-requests/${request.proof_request_id}/attachments`, { token: claimant.token, method: 'PUT', headers: { 'Content-Type': 'image/png' }, body: Buffer.from('not image') })
   assert.equal(invalid.status, 400)
-  const bytes = Buffer.from('%PDF-1.4 proof fixture')
+  const bytes = Buffer.from('%PDF-1.4\nproof fixture\n%%EOF')
   const uploads = await Promise.all([1, 2].map(() => api(`/api/conversations/proof-requests/${request.proof_request_id}/attachments`, { token: claimant.token, method: 'PUT', headers: { 'Content-Type': 'application/pdf' }, body: bytes })))
   assert.deepEqual(uploads.map((r) => r.status).sort(), [201, 409])
   const attachment = (await uploads.find((r) => r.status === 201).json()).attachment

@@ -82,7 +82,7 @@ router.post("/register", async (req, res) => {
       });
     }
 
-    console.error("Registration failed:", error.message);
+    console.error("Registration failed.");
 
     return res.status(500).json({
       message: "Could not create account.",
@@ -145,7 +145,7 @@ router.post("/login", async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("Login failed:", error.message);
+    console.error("Login failed.");
 
     return res.status(500).json({
       message: "Could not log in.",

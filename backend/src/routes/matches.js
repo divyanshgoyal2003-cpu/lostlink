@@ -524,7 +524,7 @@ router.get("/", async (req, res) => {
       note: "Match scores are estimates, not probabilities or proof of ownership.",
     });
   } catch (error) {
-    console.error("Find matches failed:", error.message);
+    console.error("Find matches failed.");
 
     return res.status(500).json({
       error: "Unable to calculate candidate matches"
@@ -722,14 +722,11 @@ router.post("/refresh", async (req, res) => {
       try {
         await client.query("ROLLBACK");
       } catch (rollbackError) {
-        console.error(
-          "Match refresh rollback failed:",
-          rollbackError.message
-        );
+        console.error("Match refresh rollback failed.");
       }
     }
 
-    console.error("Refresh matches failed:", error.message);
+    console.error("Refresh matches failed.");
 
     res.status(500).json({
       error: "Unable to refresh persistent matches",
