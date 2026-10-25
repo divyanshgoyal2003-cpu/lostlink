@@ -18,9 +18,26 @@ const DESCRIPTIONS = {
   MATCH_FOUND: 'A new possible match is available for one of your lost reports.',
   CLAIM_SUBMITTED: 'Your claim was submitted.',
   NEW_CLAIM: 'A new claim was submitted for a found item you reported.',
+  NEW_AUTHORITY_CLAIM: 'A new claim is waiting for your authority team to review.',
   CLAIM_IN_REVIEW: 'Your claim is now under review.',
+  CLAIM_VERIFICATION_PASSED: 'Ownership verification passed; a reviewer must still make the claim decision.',
+  CLAIM_VERIFICATION_FAILED: 'A reviewer marked ownership verification as failed. Check My Claims for the current claim status.',
+  CLAIM_VERIFICATION_UPDATED: 'A reviewer updated ownership verification. Check My Claims for the latest claim status.',
   CLAIM_APPROVED: 'Your claim was approved.',
   CLAIM_REJECTED: 'Your claim was rejected.',
+  CLAIM_CHAT_ENABLED: 'Chat is enabled for your claim. Open My Claims to continue.',
+  NEW_CLAIM_MESSAGE: 'You received a new message in a claim conversation.',
+  PROOF_REQUESTED: 'A reviewer requested ownership evidence in your claim conversation.',
+  PROOF_ACCEPTED: 'The proof you submitted was accepted. Check the claim conversation for the next step.',
+  PROOF_MORE_INFORMATION: 'More information was requested for your proof. Open the claim conversation for instructions.',
+  PROOF_REQUEST_CANCELLED: 'A proof request in your claim conversation was cancelled.',
+  PROOF_SUBMITTED: 'A claimant submitted requested proof in the claim conversation.',
+  AUTHORITY_MEMBERSHIP_APPROVED: 'Your authority membership was approved.',
+  AUTHORITY_MEMBERSHIP_REJECTED: 'Your authority membership request was not approved.',
+  AUTHORITY_CASE_ASSIGNED: 'A found-item case was assigned to your authority.',
+  CUSTODY_TRANSFER_INITIATED: 'A found item is awaiting your authority’s physical receipt confirmation.',
+  CUSTODY_TRANSFER_RECEIVED: 'The authority confirmed physical receipt of a found item.',
+  HANDOVER_CODE_READY: 'A claimant generated a return code. Coordinate the in-person handover; the code is not included here.',
   HANDOVER_COMPLETED: 'The item handover is complete.',
 }
 
@@ -31,6 +48,8 @@ function NotificationCenter({ token }) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [clearing, setClearing] = useState(false)
+  const [markingAll, setMarkingAll] = useState(false)
+  const [readingIds, setReadingIds] = useState(() => new Set())
   const refreshInFlight = useRef(new Set())
   const currentToken = useRef(token)
   const mounted = useRef(false)
@@ -92,20 +111,34 @@ function NotificationCenter({ token }) {
   }
 
   async function markRead(notification) {
+    const id = String(notification.notification_id)
+    if (notification.read_at || readingIds.has(id)) return
+    setReadingIds((previous) => new Set(previous).add(id))
     try {
-      await markNotificationRead(token, notification.notification_id)
+      const result = await markNotificationRead(token, notification.notification_id)
+      const readAt = result.notification.read_at
+      setNotifications((previous) => previous.map((item) => String(item.notification_id) === id ? { ...item, read_at: item.read_at || readAt } : item))
+      setUnreadCount((previous) => Math.max(0, previous - 1))
       if (notification.navigation_target) setOpen(false)
     } catch (markError) {
       setError(markError.message || 'Could not update notification.')
+    } finally {
+      setReadingIds((previous) => { const next = new Set(previous); next.delete(id); return next })
     }
   }
 
   async function markAllRead() {
+    if (markingAll || unreadCount === 0) return
+    setMarkingAll(true)
     try {
       await markAllNotificationsRead(token)
-      setNotifications((previous) => previous.map((item) => ({ ...item, read_at: item.read_at || new Date().toISOString() })))
+      const readAt = new Date().toISOString()
+      setNotifications((previous) => previous.map((item) => ({ ...item, read_at: item.read_at || readAt })))
+      setUnreadCount(0)
     } catch (markError) {
       setError(markError.message || 'Could not update notifications.')
+    } finally {
+      setMarkingAll(false)
     }
   }
 
@@ -136,7 +169,7 @@ function NotificationCenter({ token }) {
           <div className="notification-panel-heading">
             <h2>Notifications</h2>
             <div className="notification-actions">
-              <button type="button" className="btn btn-ghost" onClick={markAllRead} disabled={unreadCount === 0}>Mark all read</button>
+              <button type="button" className="btn btn-ghost" onClick={markAllRead} disabled={unreadCount === 0 || markingAll}>{markingAll ? 'Marking…' : 'Mark all read'}</button>
               <button type="button" className="btn btn-ghost" onClick={clearAll} disabled={notifications.length === 0 || clearing}>
                 {clearing ? 'Clearing…' : 'Clear all'}
               </button>
@@ -154,7 +187,7 @@ function NotificationCenter({ token }) {
                   {notification.navigation_target && (
                     <a className="notification-open" href={notification.navigation_target} onClick={() => markRead(notification)}>View related activity</a>
                   )}
-                  {!notification.read_at && <button type="button" className="notification-open" onClick={() => markRead(notification)}>Mark as read</button>}
+                  {!notification.read_at && <button type="button" className="notification-open" disabled={readingIds.has(String(notification.notification_id))} onClick={() => markRead(notification)}>{readingIds.has(String(notification.notification_id)) ? 'Marking…' : 'Mark as read'}</button>}
                 </li>
               ))}
             </ul>

@@ -1,8 +1,13 @@
-// Called inside the transaction that persists the associated event. The
-// owning event row/advisory lock serializes creation, and this guard makes
-// retries idempotent without changing the existing notifications schema.
+// Call inside the transaction that persists the event. A transaction-scoped
+// advisory lock serializes application writers for the same notification key;
+// the existence check makes retries idempotent without a schema change.
 async function createNotification(client, userId, notificationType, referenceType, referenceId) {
   if (!userId || !referenceId) return null
+  const lockKey = JSON.stringify([String(userId), notificationType, referenceType, String(referenceId)])
+  await client.query(
+    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+    [lockKey]
+  )
   const result = await client.query(
     `INSERT INTO notifications (user_id, notification_type, reference_type, reference_id)
      SELECT $1::bigint, $2::varchar(40), $3::varchar(40), $4::bigint

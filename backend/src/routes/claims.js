@@ -614,6 +614,16 @@ router.post("/:claimId/verifications", authenticateToken, async (req, res) => {
        VALUES ($1, 'CLAIM_VERIFICATION_RECORDED', 'CLAIM', $2, $3::jsonb)`,
       [req.user.userId, claimId, JSON.stringify({ verificationType, verificationStatus })]
     );
+    const verificationNotificationType = verificationStatus === "PASSED"
+      ? "CLAIM_VERIFICATION_PASSED"
+      : verificationStatus === "FAILED" ? "CLAIM_VERIFICATION_FAILED" : "CLAIM_VERIFICATION_UPDATED";
+    await createNotification(
+      client,
+      claim.claimant_user_id,
+      verificationNotificationType,
+      "CLAIM_VERIFICATION",
+      inserted.rows[0].verification_id
+    );
     await client.query("COMMIT");
 
     // Private note and evidence fields are deliberately excluded from the response.
@@ -839,11 +849,35 @@ router.post("/:claimId/handover/code", authenticateToken, async (req, res) => {
         [claimId, codeHash, HANDOVER_CODE_TTL_MINUTES]
       );
     }
-    await client.query(
+    const handoverAudit = await client.query(
       `INSERT INTO audit_logs (actor_user_id, action_type, entity_type, entity_id, metadata)
-       VALUES ($1, 'HANDOVER_CODE_ISSUED', 'CLAIM', $2, $3::jsonb)`,
+       VALUES ($1, 'HANDOVER_CODE_ISSUED', 'CLAIM', $2, $3::jsonb)
+       RETURNING audit_id`,
       [req.user.userId, claimId, JSON.stringify({ expiresInMinutes: HANDOVER_CODE_TTL_MINUTES })]
     );
+    const handoverRecipients = claim.recovery_mode === "AUTHORITY"
+      ? await client.query(
+        `SELECT DISTINCT am.user_id
+         FROM authority_memberships am
+         JOIN authority_destinations ad ON ad.authority_id=am.authority_id
+         JOIN users u ON u.user_id=am.user_id
+         WHERE am.authority_id=$1 AND am.membership_status='ACTIVE'
+           AND u.account_status='ACTIVE' AND ad.verification_status='VERIFIED'
+           AND ad.destination_status='ACTIVE'
+           AND EXISTS (SELECT 1 FROM custody_transfer_requests ctr
+                       WHERE ctr.report_id=$2 AND ctr.custody_status='RECEIVED')`,
+        [claim.authority_id, claim.found_report_id]
+      )
+      : { rows: [{ user_id: claim.found_owner_id }] };
+    for (const recipient of handoverRecipients.rows) {
+      await createNotification(
+        client,
+        recipient.user_id,
+        "HANDOVER_CODE_READY",
+        "HANDOVER_CODE",
+        handoverAudit.rows[0].audit_id
+      );
+    }
     await client.query("COMMIT");
     return res.status(existing.rowCount ? 200 : 201).json({
       message: "Handover code retrieved; show it only to the person completing the return",

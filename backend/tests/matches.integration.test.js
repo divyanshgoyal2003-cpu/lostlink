@@ -90,6 +90,7 @@ async function createReport({
   title,
   brand,
   model,
+  description = "Integration test item",
   color = "Black",
   ownerId = userId,
 }) {
@@ -111,7 +112,7 @@ async function createReport({
     [
       "ELECTRONICS",
       title,
-      "Integration test item",
+      description,
       color,
       JSON.stringify(attributes),
     ]
@@ -254,6 +255,13 @@ test("My Reports remains owner-scoped after general browsing is retired", async 
     reportType: "FOUND",
     title: "Owner report management test",
     description: "Owner-only description",
+    attributes: {
+      model: "WH-1000XM5",
+      pattern: "small white stitched star",
+      password: "test-only-sentinel",
+      api_token: "test-token-sentinel",
+      proof_attachment: "test-proof-sentinel",
+    },
   });
   assert.equal(createResponse.status, 201);
   const created = await createResponse.json();
@@ -264,7 +272,35 @@ test("My Reports remains owner-scoped after general browsing is retired", async 
   assert.equal(response.status, 200);
   const body = await response.json();
   assert.ok(body.reports.some((report) => String(report.report_id) === String(created.report.report_id)));
-  assert.ok(body.reports.some((report) => report.title === "Owner report management test"));
+  const ownerReport = body.reports.find((report) => String(report.report_id) === String(created.report.report_id));
+  assert.equal(ownerReport.title, "Owner report management test");
+  assert.equal(ownerReport.description, "Owner-only description");
+  assert.equal(ownerReport.company, "Sony");
+  assert.equal(ownerReport.item_attributes.model, "WH-1000XM5");
+  assert.equal(ownerReport.item_attributes.pattern, "small white stitched star");
+  assert.equal(Object.hasOwn(ownerReport.item_attributes, "password"), false);
+  assert.equal(Object.hasOwn(ownerReport.item_attributes, "api_token"), false);
+  assert.equal(Object.hasOwn(ownerReport.item_attributes, "proof_attachment"), false);
+  assert.equal(ownerReport.location_source, "MAP_PIN");
+  assert.equal(Number(ownerReport.latitude.toFixed(2)), 12.97);
+  assert.equal(Number(ownerReport.longitude.toFixed(2)), 79.16);
+  assert.equal(ownerReport.location_accuracy_m, null);
+
+  const otherRegistration = await api("/api/auth/register", {
+    method: "POST",
+    body: JSON.stringify({
+      name: "Other Report Details Test",
+      email: `lostlink-other-report-${process.pid}-${Date.now()}@example.test`,
+      password: "Integration-Test-Password-789",
+    }),
+  });
+  assert.equal(otherRegistration.status, 201);
+  const otherUser = await otherRegistration.json();
+  otherUserIds.push(otherUser.user.user_id);
+  const otherReportsResponse = await api("/api/reports/mine", { token: otherUser.token });
+  assert.equal(otherReportsResponse.status, 200);
+  const otherReports = await otherReportsResponse.json();
+  assert.equal(otherReports.reports.some((report) => String(report.report_id) === String(created.report.report_id)), false);
 
   await pool.query("UPDATE reports SET status = 'RETURNED', updated_at = NOW() WHERE report_id = $1", [created.report.report_id]);
   const activeResponse = await api("/api/reports/mine", { authenticated: true });
@@ -274,6 +310,109 @@ test("My Reports remains owner-scoped after general browsing is retired", async 
   assert.equal(historyResponse.status, 200);
   assert.equal(history.reports.some((report) => String(report.report_id) === String(created.report.report_id)), true);
   assert.equal(JSON.stringify(history).includes("photo_storage_key"), false);
+});
+
+test("report owners can update open reports, while invalid and unauthorized updates are rejected", async () => {
+  const createResponse = await createReportViaApi({
+    reportType: "FOUND",
+    title: "Editable report API test",
+    description: "Original report description",
+  });
+  assert.equal(createResponse.status, 201);
+  const created = await createResponse.json();
+  reportIds.push(created.report.report_id);
+  itemIds.push(created.item.item_id);
+
+  const updatedResponse = await api(`/api/reports/${created.report.report_id}`, {
+    method: "PATCH",
+    authenticated: true,
+    body: JSON.stringify({ title: "Updated report API test" }),
+  });
+  assert.equal(updatedResponse.status, 200);
+  const updated = await updatedResponse.json();
+  assert.equal(updated.item.title, "Updated report API test");
+
+  const invalidResponse = await api(`/api/reports/${created.report.report_id}`, {
+    method: "PATCH",
+    authenticated: true,
+    body: JSON.stringify({ title: "   " }),
+  });
+  assert.equal(invalidResponse.status, 400);
+
+  const registration = await api("/api/auth/register", {
+    method: "POST",
+    body: JSON.stringify({
+      name: "Other LostLink Integration Test",
+      email: `lostlink-other-test-${process.pid}-${Date.now()}@example.test`,
+      password: "Integration-Test-Password-456",
+    }),
+  });
+  assert.equal(registration.status, 201);
+  const otherUser = await registration.json();
+  otherUserIds.push(otherUser.user.user_id);
+
+  const unauthorizedResponse = await api(`/api/reports/${created.report.report_id}`, {
+    method: "PATCH",
+    token: otherUser.token,
+    body: JSON.stringify({ title: "Unauthorized report edit" }),
+  });
+  assert.equal(unauthorizedResponse.status, 404);
+
+  const ownerListResponse = await api("/api/reports/mine", { authenticated: true });
+  assert.equal(ownerListResponse.status, 200);
+  const ownerList = await ownerListResponse.json();
+  const listedReport = ownerList.reports.find(
+    (report) => String(report.report_id) === String(created.report.report_id)
+  );
+  assert.equal(listedReport.title, "Updated report API test");
+});
+
+test("report owners can close an open report once; closed reports remain read-only in My Reports", async () => {
+  const createResponse = await createReportViaApi({
+    reportType: "FOUND",
+    title: "Closable report API test",
+  });
+  assert.equal(createResponse.status, 201);
+  const created = await createResponse.json();
+  reportIds.push(created.report.report_id);
+  itemIds.push(created.item.item_id);
+
+  const closeResponse = await api(`/api/reports/${created.report.report_id}/close`, {
+    method: "PATCH",
+    authenticated: true,
+  });
+  assert.equal(closeResponse.status, 200);
+  const closed = await closeResponse.json();
+  assert.equal(closed.report.status, "CANCELLED");
+
+  const closedEditResponse = await api(`/api/reports/${created.report.report_id}`, {
+    method: "PATCH",
+    authenticated: true,
+    body: JSON.stringify({ title: "Edit after close" }),
+  });
+  assert.equal(closedEditResponse.status, 404);
+
+  const repeatCloseResponse = await api(`/api/reports/${created.report.report_id}/close`, {
+    method: "PATCH",
+    authenticated: true,
+  });
+  assert.equal(repeatCloseResponse.status, 404);
+
+  const ownerListResponse = await api("/api/reports/mine", { authenticated: true });
+  assert.equal(ownerListResponse.status, 200);
+  const ownerList = await ownerListResponse.json();
+  const listedReport = ownerList.reports.find(
+    (report) => String(report.report_id) === String(created.report.report_id)
+  );
+  assert.equal(listedReport.status, "CANCELLED");
+
+  const historyResponse = await api("/api/reports/mine/history", { authenticated: true });
+  assert.equal(historyResponse.status, 200);
+  const history = await historyResponse.json();
+  assert.equal(
+    history.reports.some((report) => String(report.report_id) === String(created.report.report_id)),
+    false
+  );
 });
 
 test("My Matches never returns found-item free text that could reveal verification details", async () => {
@@ -360,25 +499,28 @@ test("a forged lost report ID cannot expose another user's matches", async () =>
 test("production SQL rejects mismatched brands and scores identical models", async () => {
   await createReport({
     reportType: "LOST",
-    title: "Sony Bluetooth headphones",
+    title: "Wireless earbuds",
     brand: "Sony",
-    model: "WH-1000XM5",
+    model: "WF-1000XM5",
+    description: "Left beside the fountain by the west gate",
   });
 
   await createReport({
     reportType: "FOUND",
-    title: "Sony Bluetooth headphones",
+    title: "Earbud set",
     brand: "Sony",
-    model: "WH-1000XM5",
+    model: "WF-1000XM5",
+    description: "Found near the stone statue by the east stairs",
   });
 
   // This found item must be rejected because both brands are known
   // and incompatible, even though the model happens to be the same.
   await createReport({
     reportType: "FOUND",
-    title: "JBL Bluetooth headphones",
+    title: "Wireless earbud set",
     brand: "JBL",
-    model: "WH-1000XM5",
+    model: "WF-1000XM5",
+    description: "Found near the stone statue by the east stairs",
   });
 
   const response = await api("/api/matches", {
@@ -392,6 +534,7 @@ test("production SQL rejects mismatched brands and scores identical models", asy
   assert.equal(body.count, 1);
   assert.equal(body.matches.length, 1);
   assert.equal(body.matches[0].modelScore, 100);
+  assert.equal(body.matches[0].scoreBreakdown.brandModel, 100);
 });
 
 test("different known models remain candidates with a model score of zero", async () => {
@@ -421,16 +564,70 @@ test("different known models remain candidates with a model score of zero", asyn
   assert.equal(body.matches[0].modelScore, 0);
 });
 
-test("unknown brands and models remain eligible with a neutral model score", async () => {
+test("identical explicit unknown values do not make generic Black phone reports actionable", async () => {
+  const lostResponse = await createReportViaApi({
+    reportType: "LOST",
+    title: "Black phone",
+    company: "I don't know",
+    attributes: { model: "I don't know" },
+    description: "A black phone",
+  });
+  const foundResponse = await createReportViaApi({
+    reportType: "FOUND",
+    title: "Black mobile phone",
+    company: "I don't know",
+    attributes: { model: "I don't know" },
+    description: "A black phone",
+  });
+  assert.equal(lostResponse.status, 201);
+  assert.equal(foundResponse.status, 201);
+  const lost = await lostResponse.json();
+  const found = await foundResponse.json();
+  for (const created of [lost, found]) {
+    reportIds.push(created.report.report_id);
+    itemIds.push(created.item.item_id);
+  }
+
+  const savedUnknowns = await pool.query(
+    `SELECT attributes_json->>'company' AS company, attributes_json->>'model' AS model
+     FROM items WHERE item_id = ANY($1::bigint[]) ORDER BY item_id`,
+    [[lost.item.item_id, found.item.item_id]]
+  );
+  assert.equal(savedUnknowns.rowCount, 2);
+  assert.ok(savedUnknowns.rows.every((row) => row.company === "I don't know" && row.model === "I don't know"));
+
+  const response = await api("/api/matches", { authenticated: true });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.count, 0);
+
+  const refresh = await api("/api/matches/refresh", { method: "POST", authenticated: true });
+  assert.equal(refresh.status, 200);
+  const refreshed = await refresh.json();
+  assert.equal(refreshed.candidatesFound, 0);
+  const persisted = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM match_records
+     WHERE lost_report_id = $1 AND found_report_id = $2`,
+    [lost.report.report_id, found.report.report_id]
+  );
+  assert.equal(persisted.rows[0].count, 0);
+});
+
+test("strong descriptive match remains eligible when both brand and model are unknown", async () => {
   await createReport({
     reportType: "LOST",
-    title: "Bluetooth headphones",
-    brand: "Sony",
+    title: "Black phone",
+    brand: "I don't know",
+    model: "I don't know",
+    description: "Black phone with a small crack in the bottom right corner of the screen and a transparent case with a yellow sticker.",
   });
 
   await createReport({
     reportType: "FOUND",
-    title: "Bluetooth headphones",
+    title: "Mobile phone",
+    brand: "I don't know",
+    model: "I don't know",
+    description: "Black phone with a cracked bottom right corner of the screen and a transparent case with a yellow sticker.",
   });
 
   const response = await api("/api/matches", {
@@ -443,6 +640,40 @@ test("unknown brands and models remain eligible with a neutral model score", asy
 
   assert.equal(body.count, 1);
   assert.equal(body.matches[0].modelScore, 50);
+  assert.equal(body.matches[0].scoreBreakdown.brandModel, 50);
+});
+
+test("one-sided unknown brand and model are neutral, not an exact match or contradiction", async () => {
+  await createReport({
+    reportType: "LOST",
+    title: "Black phone",
+    brand: "I don't know",
+    model: "I don't know",
+    description: "Black phone with a crack beside a violet star sticker",
+  });
+  await createReport({
+    reportType: "FOUND",
+    title: "Mobile phone",
+    brand: "Sony",
+    model: "WH-1000XM5",
+    description: "Mobile phone with a crack beside a violet star sticker",
+  });
+
+  const response = await api("/api/matches", { authenticated: true });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.count, 1);
+  assert.equal(body.matches[0].scoreBreakdown.brandModel, 50);
+});
+
+test("generic title overlap with unrelated descriptions is not sufficient evidence", async () => {
+  await createReport({ reportType: "LOST", title: "Black phone", brand: "I don't know", model: "I don't know", description: "A black phone" });
+  await createReport({ reportType: "FOUND", title: "Black phone", brand: "I don't know", model: "I don't know", description: "Black phone with a shattered screen and a red case" });
+
+  const response = await api("/api/matches", { authenticated: true });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.count, 0);
 });
 
 test("POST /api/matches/refresh persists the production model score", async () => {

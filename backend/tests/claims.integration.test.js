@@ -203,10 +203,18 @@ afterEach(async () => {
   // Delete claims before matches because claims reference match_records.
   if (matchIds.length > 0) {
     await pool.query(
-      `DELETE FROM notifications
-       WHERE reference_type = 'CLAIM'
-         AND (reference_id = ANY($2::bigint[]) OR reference_id IN (
+      `DELETE FROM notifications n
+       WHERE (n.reference_type = 'CLAIM'
+         AND (n.reference_id = ANY($2::bigint[]) OR n.reference_id IN (
            SELECT claim_id FROM claim_requests WHERE match_id = ANY($1::bigint[])
+         )))
+         OR (n.reference_type = 'CLAIM_VERIFICATION' AND n.reference_id IN (
+           SELECT verification_id FROM claim_verifications
+           WHERE claim_id IN (SELECT claim_id FROM claim_requests WHERE match_id = ANY($1::bigint[]))
+         ))
+         OR (n.reference_type = 'HANDOVER_CODE' AND n.reference_id IN (
+           SELECT audit_id FROM audit_logs WHERE action_type='HANDOVER_CODE_ISSUED'
+             AND entity_type='CLAIM' AND entity_id IN (SELECT claim_id FROM claim_requests WHERE match_id = ANY($1::bigint[]))
          ))`,
       [matchIds, claimIds]
     );
@@ -962,6 +970,26 @@ test("verification starts review and private notes stay out of participant respo
   );
   assert.equal(reviewNotification.rows[0].count, 1);
 
+  const verificationNotification = await pool.query(
+    `SELECT notification_id FROM notifications
+     WHERE user_id=$1 AND notification_type='CLAIM_VERIFICATION_PASSED'
+       AND reference_type='CLAIM_VERIFICATION' AND reference_id=$2`,
+    [userId, body.verification.verification_id]
+  )
+  assert.equal(verificationNotification.rowCount, 1)
+  const claimantNotificationList = await api("/api/notifications", { token })
+  const claimantNotifications = await claimantNotificationList.json()
+  const verificationNotice = claimantNotifications.notifications.find((item) => item.notification_type === "CLAIM_VERIFICATION_PASSED")
+  assert.equal(verificationNotice?.navigation_target, "#my-claims")
+  assert.equal(JSON.stringify(claimantNotifications).includes(privateNote), false)
+  const foundOwnerNotice = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM notifications
+     WHERE user_id=$1 AND notification_type LIKE 'CLAIM_VERIFICATION_%'
+       AND reference_type='CLAIM_VERIFICATION' AND reference_id=$2`,
+    [foundOwnerId, body.verification.verification_id]
+  )
+  assert.equal(foundOwnerNotice.rows[0].count, 0)
+
   const participantClaims = await api("/api/claims", { token });
   const participantBody = await participantClaims.json();
   assert.equal(JSON.stringify(participantBody).includes(privateNote), false);
@@ -1041,7 +1069,7 @@ test("approval requires a passed verification and rejected claims reopen reports
   assert.equal(rejectionNotification.rows[0].count, 1);
 });
 
-test("unknown reviewers are rejected before verification changes claim state", async () => {
+test("nonexistent reviewers are rejected during authentication before claim state changes", async () => {
   const matchId = await createClaimableMatch();
   const claim = await submitClaim(matchId);
   const missingUserToken = jwt.sign(
@@ -1058,8 +1086,8 @@ test("unknown reviewers are rejected before verification changes claim state", a
       privateNote: "Must rollback with the failed transaction",
     }),
   });
-  assert.equal(response.status, 403);
-  assert.deepEqual(await response.json(), { error: "You are not authorized to review this claim" });
+  assert.equal(response.status, 401);
+  assert.deepEqual(await response.json(), { message: "This account is not active." });
 
   const state = await pool.query(
     `SELECT c.claim_status, m.match_status, lost.status AS lost_status,
@@ -1118,6 +1146,28 @@ test("only the claimant receives a hashed handover code; found owner confirms it
   assert.notEqual(stored.rows[0].code_hash, issuedBody.code);
   assert.match(stored.rows[0].code_hash, /^[a-f0-9]{64}$/);
   assert.ok(new Date(stored.rows[0].code_expires_at).getTime() > Date.now());
+
+  const handoverNotice = await pool.query(
+    `SELECT n.notification_id, n.reference_id FROM notifications n
+     JOIN audit_logs a ON a.audit_id=n.reference_id
+     WHERE n.user_id=$1 AND n.notification_type='HANDOVER_CODE_READY'
+       AND n.reference_type='HANDOVER_CODE' AND a.entity_id=$2
+       AND a.action_type='HANDOVER_CODE_ISSUED'`,
+    [foundOwnerId, claim.claim_id]
+  )
+  assert.equal(handoverNotice.rowCount, 1)
+  const finderNotifications = await api("/api/notifications", { token: foundOwnerToken })
+  const finderNotificationBody = await finderNotifications.json()
+  const codeReadyNotification = finderNotificationBody.notifications.find((item) => item.notification_type === "HANDOVER_CODE_READY")
+  assert.equal(codeReadyNotification?.navigation_target, "#my-claims")
+  assert.equal(JSON.stringify(finderNotificationBody).includes(issuedBody.code), false)
+  const claimantCodeReady = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM notifications
+     WHERE user_id=$1 AND notification_type='HANDOVER_CODE_READY' AND reference_type='HANDOVER_CODE'
+       AND reference_id=$2`,
+    [userId, handoverNotice.rows[0].reference_id]
+  )
+  assert.equal(claimantCodeReady.rows[0].count, 0)
 
   const claimantCannotConfirm = await api(`/api/claims/${claim.claim_id}/handover/confirm`, {
     method: "POST",

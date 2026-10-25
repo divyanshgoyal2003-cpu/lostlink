@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import {
   loginUser,
   registerUser,
@@ -17,11 +17,13 @@ import './App.css'
 import LocationPicker from './components/LocationPicker'
 import ClaimWorkflow from './components/ClaimWorkflow'
 import FoundPhotoCapture from './components/FoundPhotoCapture'
+import ReportDetailsViewer, { ReportDetailsButton } from './components/ReportDetailsViewer'
 import NotificationCenter from './components/NotificationCenter'
 import AuthorityPortal from './components/AuthorityPortal'
 import ReturnHistory from './components/ReturnHistory'
 import { filterAndSortMatches } from './matchFilters'
 import { getMatchClaimState } from './claimCardState'
+import { reportDetailsReducer } from './reportDetails'
 
 const DEFAULT_MATCH_FILTERS = {
   keyword: '',
@@ -32,6 +34,7 @@ const DEFAULT_MATCH_FILTERS = {
   foundDateTo: '',
   sort: 'score',
 }
+const COPYRIGHT_YEAR = new Date().getFullYear()
 
 function App() {
   const [editingReportId, setEditingReportId] = useState(null)
@@ -84,7 +87,6 @@ const [hasAuthorityAccess, setHasAuthorityAccess] = useState(false)
 const [myMatches, setMyMatches] = useState([])
 const [matchesLoading, setMatchesLoading] = useState(false)
 const [matchesError, setMatchesError] = useState('')
-const [matchesMessage, setMatchesMessage] = useState('')
 const [matchScoreThreshold, setMatchScoreThreshold] = useState(null)
 const [strongMatchThreshold, setStrongMatchThreshold] = useState(null)
 const [matchFilters, setMatchFilters] = useState({ ...DEFAULT_MATCH_FILTERS })
@@ -94,6 +96,16 @@ const [claimsLoaded, setClaimsLoaded] = useState(false)
 const [claimSubmittingMatchId, setClaimSubmittingMatchId] = useState('')
 const [claimCardMessages, setClaimCardMessages] = useState({})
 const claimSubmissionLocks = useRef(new Set())
+const [viewingReport, dispatchReportDetails] = useReducer(reportDetailsReducer, null)
+const reportDetailsTriggerRef = useRef(null)
+const openReportDetails = useCallback((report, trigger) => {
+  reportDetailsTriggerRef.current = trigger
+  dispatchReportDetails({ type: 'open', report })
+}, [])
+const closeReportDetails = useCallback(() => {
+  dispatchReportDetails({ type: 'close' })
+  window.requestAnimationFrame(() => reportDetailsTriggerRef.current?.focus())
+}, [])
 
 const [currentUser, setCurrentUser] = useState(() => {
   try {
@@ -245,9 +257,9 @@ attributes:
   } finally {
     setReportLoading(false)
   }
-}async function loadMyReports()
+}
 
- {
+async function loadMyReports() {
   if (!authToken) {
     setMyReports([])
     return
@@ -420,24 +432,24 @@ async function handleCloseReport(reportId) {
 
 useEffect(() => {
   if (authToken) {
-    if (currentUser?.role === 'USER') setAuthorityAccessLoading(true)
     getAuthorityMemberships(authToken).then((result) => {
       setHasAuthorityAccess((result.memberships || []).some((membership) => membership.membership_status === 'ACTIVE' && membership.verification_status === 'VERIFIED' && membership.destination_status === 'ACTIVE'))
     }).catch(() => setHasAuthorityAccess(false)).finally(() => setAuthorityAccessLoading(false))
-    loadMyReports()
+    getMyReports(authToken)
+      .then((result) => {
+        setMyReports(result.reports || [])
+        setReportsError('')
+      })
+      .catch((error) => setReportsError(error.message || 'Could not load your reports.'))
+      .finally(() => setReportsLoading(false))
     getAuthorityDestinations(authToken)
       .then((result) => {
         setAuthorityDestinations(result.destinations || [])
         setAuthorityDestinationsError('')
       })
       .catch((error) => setAuthorityDestinationsError(error.message || 'Could not load authority destinations.'))
-  } else {
-    setHasAuthorityAccess(false)
-    setAuthorityAccessLoading(false)
-    setMyReports([])
-    setAuthorityDestinations([])
   }
-}, [authToken])
+}, [authToken, currentUser?.role])
 
 useEffect(() => {
   if (!authToken) return undefined
@@ -514,7 +526,9 @@ function updateMatchFilter(event) {
     setAuthToken(null)
     setCurrentUser(null)
     setHasAuthorityAccess(false)
+    setAuthorityAccessLoading(false)
     setMyReports([])
+    setAuthorityDestinations([])
     setMyMatches([])
     setMatchScoreThreshold(null)
     setStrongMatchThreshold(null)
@@ -955,7 +969,7 @@ function updateMatchFilter(event) {
     <div className="my-reports-list">
       {myReports.map((report) => (
         <article
-          className="my-report-card"
+          className="my-report-card my-owned-report-card"
           key={report.report_id}
         >
           <div className="my-report-card-top">
@@ -968,9 +982,12 @@ function updateMatchFilter(event) {
             >
               {report.report_type}
             </span>
-            <span className="my-report-status">
-              {(report.status || 'OPEN').replaceAll('_', ' ')}
-            </span>
+            <div className="my-report-card-tools">
+              <span className="my-report-status">
+                {(report.status || 'OPEN').replaceAll('_', ' ')}
+              </span>
+              <ReportDetailsButton report={report} onOpen={openReportDetails} />
+            </div>
           </div>
           <h3>{report.title || report.item_title || 'Reported item'}</h3>
           {report.category && (
@@ -992,7 +1009,7 @@ function updateMatchFilter(event) {
           <p className="my-report-id">
             Report ID: {report.report_id}
           </p>
-          {editingReportId === report.report_id ? (
+          {editingReportId === report.report_id && report.status === 'OPEN' ? (
   <div className="edit-report-form">
     <label>
       Item title
@@ -1059,23 +1076,25 @@ function updateMatchFilter(event) {
   </div>
 ) : (
   <div className="report-action-buttons">
-    <button
-      type="button"
-      className="btn btn-secondary"
-      disabled={reportActionLoading}
-      onClick={() => {
-        setEditReportForm({
-          title: report.title || '',
-          description: report.description || '',
-          color: report.color || '',
-        })
-        setEditingReportId(report.report_id)
-        setReportActionMessage('')
-        setReportActionError('')
-      }}
-    >
-      Edit
-    </button>
+    {report.status === 'OPEN' && (
+      <button
+        type="button"
+        className="btn btn-secondary"
+        disabled={reportActionLoading}
+        onClick={() => {
+          setEditReportForm({
+            title: report.title || '',
+            description: report.description || '',
+            color: report.color || '',
+          })
+          setEditingReportId(report.report_id)
+          setReportActionMessage('')
+          setReportActionError('')
+        }}
+      >
+        Edit
+      </button>
+    )}
 
     {report.status === 'OPEN' && (
       <button
@@ -1089,7 +1108,7 @@ function updateMatchFilter(event) {
     )}
   </div>
 )}
-          {report.report_type === 'FOUND' && currentUser && (
+          {report.report_type === 'FOUND' && report.status === 'OPEN' && currentUser && (
             <FoundPhotoCapture token={authToken} report={report} />
           )}
         </article>
@@ -1097,6 +1116,9 @@ function updateMatchFilter(event) {
     </div>
   )}
 </section>
+{viewingReport && (
+  <ReportDetailsViewer report={viewingReport} token={authToken} onClose={closeReportDetails} />
+)}
 {currentUser && (hasAuthorityDashboard || hasFoundReports) && <AuthorityPortal token={authToken} user={currentUser} onLogin={() => openAuth('login')} />}
 {currentUser && <ReturnHistory token={authToken} />}
 <section className="my-reports-section" id="my-matches">
@@ -1250,8 +1272,23 @@ function updateMatchFilter(event) {
               <p><strong>Found item details:</strong> Hidden to protect ownership-verification details.</p>
               <p><strong>Lost report date:</strong> {new Date(match.lostReportTime).toLocaleDateString()}</p>
               <p><strong>Found report date:</strong> {new Date(match.foundReportTime).toLocaleDateString()}</p>
-              <p>Approximate distance: {match.approximateDistanceM} m · {match.daysApart} days apart</p>
+              <p>Approximate distance: {match.approximateDistanceM} m · {match.daysApart == null ? 'time estimate unavailable' : `${match.daysApart} days apart`}</p>
               <p>Score measures similarity, not probability of ownership. It never approves a claim automatically.</p>
+              {match.scoreBreakdown && (
+                <details className="match-score-explanation">
+                  <summary>Why this match?</summary>
+                  <p>Similarity by detail (0–100). Missing information may receive a neutral score.</p>
+                  <ul>
+                    <li>Location: {Number(match.scoreBreakdown.location).toFixed(0)}/100</li>
+                    <li>Category: {Number(match.scoreBreakdown.category).toFixed(0)}/100 (same category is required)</li>
+                    <li>Color: {Number(match.scoreBreakdown.color).toFixed(0)}/100</li>
+                    <li>Time: {Number(match.scoreBreakdown.time).toFixed(0)}/100</li>
+                    <li>Title: {Number(match.scoreBreakdown.title).toFixed(0)}/100</li>
+                    <li>Description: {Number(match.scoreBreakdown.description).toFixed(0)}/100</li>
+                    <li>Brand/model: {Number(match.scoreBreakdown.brandModel).toFixed(0)}/100</li>
+                  </ul>
+                </details>
+              )}
               {(() => {
                 if (!currentUser || !authToken) {
                   return <p className="claim-muted">Log in to submit a claim.</p>
@@ -1327,7 +1364,7 @@ function updateMatchFilter(event) {
           <span>Lost<span className="brand-accent">Link</span></span>
         </a>
         <span>Helping lost things find their way home.</span>
-        <span>© {new Date().getFullYear()} LostLink</span>
+        <span>© {COPYRIGHT_YEAR} LostLink</span>
       </footer>}
 
       {authMode && (

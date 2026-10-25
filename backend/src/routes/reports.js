@@ -774,6 +774,8 @@ router.get("/mine", authenticateToken, async (req, res) => {
          r.report_time,
          r.status,
          r.uncertainty_radius_m,
+         r.location_accuracy_m,
+         r.location_source,
          r.location_description,
          i.item_id,
          i.category,
@@ -781,6 +783,9 @@ router.get("/mine", authenticateToken, async (req, res) => {
          i.description,
          i.color,
          i.attributes_json->>'company' AS company,
+         (SELECT COALESCE(jsonb_object_agg(attribute.key, attribute.value), '{}'::jsonb)
+          FROM jsonb_each(i.attributes_json) AS attribute
+          WHERE attribute.key !~* '(password|token|secret|credential|api.?key|storage|photo|proof|evidence|serial|identifier|holder|reviewer|verification|private)') AS item_attributes,
          ST_Y(r.location_point::geometry) AS latitude,
          ST_X(r.location_point::geometry) AS longitude,
          r.created_at,

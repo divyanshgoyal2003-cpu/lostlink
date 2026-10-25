@@ -14,17 +14,9 @@ import './ClaimWorkflow.css'
 import ClaimPhotoAccess from './ClaimPhotoAccess'
 import ConversationPanel from './ConversationPanel'
 import ConversationInbox from './ConversationInbox'
+import { CLAIM_STATUS_LABELS as STATUS_LABELS, describeClaimStatus } from '../claimStatus'
 
 const REVIEW_ROLES = ['STAFF', 'ADMIN']
-
-const STATUS_LABELS = {
-  SUBMITTED: 'Submitted',
-  IN_REVIEW: 'In review',
-  APPROVED: 'Approved',
-  REJECTED: 'Rejected',
-  WITHDRAWN: 'Withdrawn',
-  COMPLETED: 'Completed',
-}
 
 function readableError(error) {
   if (error.status === 400) return 'The code or details were not accepted. Check them and try again.'
@@ -35,22 +27,6 @@ function readableError(error) {
   if (error.status === 410) return 'This handover code expired. Request a fresh code from My Claims.'
   if (error.status === 429) return 'Too many incorrect codes were entered. Try again after the limit resets.'
   return error.message || 'Something went wrong. Please try again.'
-}
-
-function statusDescription(status, relationship) {
-  if (status === 'SUBMITTED') return 'Waiting for the assigned review team.'
-  if (status === 'IN_REVIEW') return 'A reviewer is checking the claim.'
-  if (status === 'APPROVED' && relationship === 'FOUND_REPORT_OWNER') {
-    return 'The claimant gets a one-time code and shows it to you; confirm the safe return after receiving the item.'
-  }
-  if (status === 'APPROVED' && relationship === 'AUTHORITY_CLAIMANT') {
-    return 'Get your one-time return code here and show it to the assigned authority.'
-  }
-  if (status === 'APPROVED') return 'Get your one-time return code here and show it to the finder.'
-  if (status === 'REJECTED') return 'This claim was rejected. Contact support if you need help.'
-  if (status === 'COMPLETED') return 'Handover confirmed.'
-  if (status === 'WITHDRAWN') return 'This claim was withdrawn.'
-  return 'Check back here for updates.'
 }
 
 function updateById(setter, id, value) {
@@ -282,7 +258,7 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hi
                   <p><strong>Submitted:</strong> {new Date(claim.submitted_at).toLocaleString()}</p>
                   <p className="claim-next-step">{claim.authority_custody_received && relationship === 'FOUND_REPORT_OWNER'
                     ? 'The assigned authority has physical custody and manages claimant release.'
-                    : statusDescription(claim.claim_status, relationship === 'CLAIMANT' && claim.authority_custody_received ? 'AUTHORITY_CLAIMANT' : relationship)}</p>
+                    : describeClaimStatus(claim.claim_status, relationship === 'CLAIMANT' && claim.authority_custody_received ? 'AUTHORITY_CLAIMANT' : relationship, claim.found_recovery_mode)}</p>
                   <ClaimPhotoAccess token={token} claimId={id} onRefresh={onRefresh} />
                   {relationship === 'FOUND_REPORT_OWNER' && claim.found_recovery_mode === 'DIRECT' &&
                     ['SUBMITTED', 'IN_REVIEW', 'APPROVED'].includes(claim.claim_status) &&

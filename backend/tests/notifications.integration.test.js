@@ -5,6 +5,7 @@ const assert = require("node:assert/strict")
 const { before, after, test } = require("node:test")
 const pool = require("../src/config/db")
 const app = require("../src/server")
+const { createNotification } = require("../src/notifications")
 
 let server
 let baseUrl
@@ -130,4 +131,31 @@ test("list, count, mark-one, and mark-all are private, bounded, and idempotent",
   assert.equal(remainingForeign.rowCount, 1)
   const clearedCountResponse = await api("/api/notifications/unread-count", { token: user.token })
   assert.equal((await clearedCountResponse.json()).unreadCount, 0)
+})
+
+test("concurrent retries create one notification for the same event key", async () => {
+  const referenceId = Date.now()
+  const results = await Promise.all(Array.from({ length: 12 }, async () => {
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      const created = await createNotification(client, user.user.user_id, "RETRY_TEST", "CLAIM", referenceId)
+      await client.query("COMMIT")
+      if (created) insertedNotificationIds.push(created.notification_id)
+      return created
+    } catch (error) {
+      await client.query("ROLLBACK")
+      throw error
+    } finally {
+      client.release()
+    }
+  }))
+  assert.equal(results.filter(Boolean).length, 1)
+  const stored = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM notifications
+     WHERE user_id=$1 AND notification_type='RETRY_TEST'
+       AND reference_type='CLAIM' AND reference_id=$2`,
+    [user.user.user_id, referenceId]
+  )
+  assert.equal(stored.rows[0].count, 1)
 })

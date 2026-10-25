@@ -399,6 +399,29 @@ test("authority members review claims only after custody and final release uses 
   const codeResponse = await api(`/api/claims/${claimId}/handover/code`, { method: "POST", token: lostUser.token });
   assert.equal(codeResponse.status, 201, await codeResponse.clone().text());
   const releaseCode = (await codeResponse.json()).code;
+  const authorityCodeReady = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM notifications n
+     JOIN audit_logs a ON a.audit_id=n.reference_id
+     WHERE n.user_id=$1 AND n.notification_type='HANDOVER_CODE_READY'
+       AND n.reference_type='HANDOVER_CODE' AND a.entity_type='CLAIM'
+       AND a.entity_id=$2 AND a.action_type='HANDOVER_CODE_ISSUED'`,
+    [assigned.member.id, claimId]
+  )
+  assert.equal(authorityCodeReady.rows[0].count, 1)
+  const ownerCodeReady = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM notifications n
+     JOIN audit_logs a ON a.audit_id=n.reference_id
+     WHERE n.user_id=$1 AND n.notification_type='HANDOVER_CODE_READY'
+       AND n.reference_type='HANDOVER_CODE' AND a.entity_type='CLAIM'
+       AND a.entity_id=$2 AND a.action_type='HANDOVER_CODE_ISSUED'`,
+    [owner.id, claimId]
+  )
+  assert.equal(ownerCodeReady.rows[0].count, 0)
+  const authorityNotificationList = await api('/api/notifications', { token: assigned.member.token })
+  const authorityNotificationBody = await authorityNotificationList.json()
+  const codeReady = authorityNotificationBody.notifications.find((entry) => entry.notification_type === 'HANDOVER_CODE_READY')
+  assert.equal(codeReady?.navigation_target, '#authority-portal')
+  assert.equal(JSON.stringify(authorityNotificationBody).includes(releaseCode), false)
   const release = await api(`/api/claims/${claimId}/handover/confirm`, { method: "POST", token: assigned.member.token, body: JSON.stringify({ code: releaseCode }) });
   assert.equal(release.status, 200, await release.clone().text());
   assert.equal((await pool.query("SELECT claim_status FROM claim_requests WHERE claim_id=$1", [claimId])).rows[0].claim_status, "COMPLETED");

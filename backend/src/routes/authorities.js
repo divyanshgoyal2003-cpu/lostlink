@@ -10,7 +10,9 @@ const router = express.Router();
 router.use(authenticateToken);
 
 function idParam(value) {
-  return /^[1-9]\d*$/.test(String(value || "")) ? String(value) : null;
+  const text = String(value || "");
+  if (!/^[1-9]\d*$/.test(text) || !Number.isSafeInteger(Number(text))) return null;
+  return text;
 }
 
 function custodySecret() {

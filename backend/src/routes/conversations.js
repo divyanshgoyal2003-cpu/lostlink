@@ -11,7 +11,9 @@ router.use((req, res, next) => {
 });
 
 function parseClaimId(value) {
-  return /^[1-9]\d*$/.test(String(value || "")) ? String(value) : null;
+  const text = String(value || "");
+  if (!/^[1-9]\d*$/.test(text) || !Number.isSafeInteger(Number(text))) return null;
+  return text;
 }
 
 async function loadContext(client, claimId, userId, lock = false) {

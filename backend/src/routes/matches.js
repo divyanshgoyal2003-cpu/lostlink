@@ -4,20 +4,34 @@ const pool = require("../config/db");
 const {
   MATCH_SCORE_THRESHOLD,
   STRONG_MATCH_THRESHOLD,
+  MATCH_WEIGHTS,
+  GENERIC_MATCH_TERMS,
+  UNKNOWN_MATCH_VALUES,
   getMatchStrength,
 } = require("../config/matching");
 
 const router = express.Router();
 const { createNotification } = require("../notifications");
+const genericWordSql = `(${GENERIC_MATCH_TERMS.map((word) => `'${word}'`).join(", ")})`;
+const unknownMatchValuesSql = `(${UNKNOWN_MATCH_VALUES.map((value) => `'${value}'`).join(", ")})`;
+const knownValueSql = (expression) => `CASE
+  WHEN NULLIF(LOWER(REGEXP_REPLACE(TRIM(${expression}), '[^[:alnum:]]+', ' ', 'g')), '') IN ${unknownMatchValuesSql} THEN NULL
+  ELSE NULLIF(LOWER(TRIM(${expression})), '')
+END`;
+const totalScoreSql = Object.entries(MATCH_WEIGHTS)
+  .map(([score, weight]) => `${score} * ${weight}`)
+  .join(" + ");
+const itemWeightTotal = MATCH_WEIGHTS.category_score + MATCH_WEIGHTS.color_score + MATCH_WEIGHTS.brand_model_score;
+const itemScoreSql = `ROUND(((category_score * ${MATCH_WEIGHTS.category_score}) + (color_score * ${MATCH_WEIGHTS.color_score}) + (brand_model_score * ${MATCH_WEIGHTS.brand_model_score})) / ${itemWeightTotal}, 2)`;
 
 /*
  * Shared candidate query.
  *
  * Pipeline:
- * 1. Filter by category and incompatible item types.
- * 2. Calculate geographic distance for compatible candidates.
- * 3. Calculate title, description, color, category, and time scores.
- * 4. Rank candidates whose uncertainty circles overlap.
+ * 1. Filter by exact category, incompatible item types, and known brand conflicts.
+ * 2. Calculate distance and elapsed time for eligible report pairs.
+ * 3. Score normalized informative text, color, category, and brand/model evidence.
+ * 4. Keep only overlapping uncertainty circles with actionable identifying evidence.
  *
  * This query is shared by GET and POST /refresh to keep scoring consistent.
  */
@@ -52,25 +66,25 @@ const candidateQuery = `
       fi.color AS found_color,
 
       COALESCE(
-        NULLIF(LOWER(TRIM(li.attributes_json->>'company')), ''),
-        NULLIF(LOWER(TRIM(li.attributes_json->>'brand')), ''),
-        NULLIF(LOWER(TRIM(le.brand)), '')
+        ${knownValueSql("li.attributes_json->>'company'")},
+        ${knownValueSql("li.attributes_json->>'brand'")},
+        ${knownValueSql("le.brand")}
       ) AS lost_brand,
 
       COALESCE(
-        NULLIF(LOWER(TRIM(fi.attributes_json->>'company')), ''),
-        NULLIF(LOWER(TRIM(fi.attributes_json->>'brand')), ''),
-        NULLIF(LOWER(TRIM(fe.brand)), '')
+        ${knownValueSql("fi.attributes_json->>'company'")},
+        ${knownValueSql("fi.attributes_json->>'brand'")},
+        ${knownValueSql("fe.brand")}
       ) AS found_brand,
 
       COALESCE(
-        NULLIF(LOWER(TRIM(li.attributes_json->>'model')), ''),
-        NULLIF(LOWER(TRIM(le.model)), '')
+        ${knownValueSql("li.attributes_json->>'model'")},
+        ${knownValueSql("le.model")}
       ) AS lost_model,
 
       COALESCE(
-        NULLIF(LOWER(TRIM(fi.attributes_json->>'model')), ''),
-        NULLIF(LOWER(TRIM(fe.model)), '')
+        ${knownValueSql("fi.attributes_json->>'model'")},
+        ${knownValueSql("fe.model")}
       ) AS found_model
 
     FROM reports l
@@ -92,29 +106,6 @@ const candidateQuery = `
 
       -- Require the same broad item category.
       AND li.category = fi.category
-      -- Reject candidates when both known brands differ.
-      AND (
-        COALESCE(
-          NULLIF(LOWER(TRIM(li.attributes_json->>'company')), ''),
-          NULLIF(LOWER(TRIM(li.attributes_json->>'brand')), ''),
-          NULLIF(LOWER(TRIM(le.brand)), '')
-        ) IS NULL
-        OR COALESCE(
-          NULLIF(LOWER(TRIM(fi.attributes_json->>'company')), ''),
-          NULLIF(LOWER(TRIM(fi.attributes_json->>'brand')), ''),
-          NULLIF(LOWER(TRIM(fe.brand)), '')
-        ) IS NULL
-        OR COALESCE(
-          NULLIF(LOWER(TRIM(li.attributes_json->>'company')), ''),
-          NULLIF(LOWER(TRIM(li.attributes_json->>'brand')), ''),
-          NULLIF(LOWER(TRIM(le.brand)), '')
-        ) = COALESCE(
-          NULLIF(LOWER(TRIM(fi.attributes_json->>'company')), ''),
-          NULLIF(LOWER(TRIM(fi.attributes_json->>'brand')), ''),
-          NULLIF(LOWER(TRIM(fe.brand)), '')
-        )
-      )
-
       -- Initial rule to reject contradictory headphone/earbud types.
       AND NOT (
         (
@@ -161,285 +152,132 @@ const candidateQuery = `
         <= lost_radius_m + found_radius_m
       ) AS circles_overlap,
 
-      ABS(
-        EXTRACT(
-          EPOCH FROM (lost_report_time - found_report_time)
-        )
-      ) / 86400.0 AS days_apart
+      CASE
+        WHEN isfinite(lost_report_time) AND isfinite(found_report_time)
+          THEN ABS(EXTRACT(EPOCH FROM (lost_report_time - found_report_time))) / 86400.0
+        ELSE NULL
+      END AS days_apart
 
     FROM item_candidates
+    WHERE lost_brand IS NULL OR found_brand IS NULL
+      OR LOWER(REGEXP_REPLACE(TRIM(lost_brand), '[^[:alnum:]]+', ' ', 'g'))
+       = LOWER(REGEXP_REPLACE(TRIM(found_brand), '[^[:alnum:]]+', ' ', 'g'))
   ),
 
   text_features AS (
     SELECT
       *,
-
-      LOWER(
-        REGEXP_REPLACE(
-          CONCAT_WS(' ', lost_title, lost_description),
-          '[^[:alnum:]]+',
-          ' ',
-          'g'
-        )
-      ) AS lost_normalized_text,
-
-      LOWER(
-        REGEXP_REPLACE(
-          CONCAT_WS(' ', found_title, found_description),
-          '[^[:alnum:]]+',
-          ' ',
-          'g'
-        )
-      ) AS found_normalized_text,
-
-      LOWER(TRIM(COALESCE(lost_title, '')))
-        AS lost_title_norm,
-
-      LOWER(TRIM(COALESCE(found_title, '')))
-        AS found_title_norm
-
+      LOWER(REGEXP_REPLACE(COALESCE(lost_title, ''), '[^[:alnum:]]+', ' ', 'g')) AS lost_title_norm,
+      LOWER(REGEXP_REPLACE(COALESCE(found_title, ''), '[^[:alnum:]]+', ' ', 'g')) AS found_title_norm,
+      LOWER(REGEXP_REPLACE(COALESCE(lost_description, ''), '[^[:alnum:]]+', ' ', 'g')) AS lost_description_norm,
+      LOWER(REGEXP_REPLACE(COALESCE(found_description, ''), '[^[:alnum:]]+', ' ', 'g')) AS found_description_norm
     FROM spatial_candidates
   ),
-
+  token_features AS (
+    SELECT
+      *,
+      ARRAY(SELECT DISTINCT word FROM REGEXP_SPLIT_TO_TABLE(lost_title_norm, '\\s+') AS token(word) WHERE LENGTH(word) > 1 AND word NOT IN ${genericWordSql}) AS lost_title_tokens,
+      ARRAY(SELECT DISTINCT word FROM REGEXP_SPLIT_TO_TABLE(found_title_norm, '\\s+') AS token(word) WHERE LENGTH(word) > 1 AND word NOT IN ${genericWordSql}) AS found_title_tokens,
+      ARRAY(SELECT DISTINCT word FROM REGEXP_SPLIT_TO_TABLE(lost_description_norm, '\\s+') AS token(word) WHERE LENGTH(word) > 1 AND word NOT IN ${genericWordSql}) AS lost_description_tokens,
+      ARRAY(SELECT DISTINCT word FROM REGEXP_SPLIT_TO_TABLE(found_description_norm, '\\s+') AS token(word) WHERE LENGTH(word) > 1 AND word NOT IN ${genericWordSql}) AS found_description_tokens
+    FROM text_features
+  ),
+  text_counts AS (
+    SELECT
+      *,
+      (SELECT COUNT(*) FROM (SELECT word FROM UNNEST(lost_title_tokens) AS lost(word) INTERSECT SELECT word FROM UNNEST(found_title_tokens) AS found(word)) shared) AS title_shared_count,
+      (SELECT COUNT(*) FROM (SELECT word FROM UNNEST(lost_title_tokens) AS lost(word) UNION SELECT word FROM UNNEST(found_title_tokens) AS found(word)) all_words) AS title_union_count,
+      (SELECT COUNT(*) FROM (SELECT word FROM UNNEST(lost_description_tokens) AS lost(word) INTERSECT SELECT word FROM UNNEST(found_description_tokens) AS found(word)) shared) AS description_shared_count,
+      (SELECT COUNT(*) FROM (SELECT word FROM UNNEST(lost_description_tokens) AS lost(word) UNION SELECT word FROM UNNEST(found_description_tokens) AS found(word)) all_words) AS description_union_count
+    FROM token_features
+  ),
   scored AS (
     SELECT
       *,
-
-      -- Location score: 0-100.
-      ROUND(
-        GREATEST(
-          0,
-          LEAST(
-            100,
-            100 * (
-              1 - distance_m /
-              NULLIF(lost_radius_m + found_radius_m, 0)
-            )
-          )
-        )::numeric,
-        2
-      ) AS location_score,
-
-      -- Same broad category is required by the candidate filter.
-      100::numeric AS category_score,
-
-      -- Missing colors are treated as unknown, not contradictory.
       CASE
-        WHEN NULLIF(TRIM(lost_color), '') IS NULL
-          OR NULLIF(TRIM(found_color), '') IS NULL
-          THEN 50
-
-        WHEN LOWER(TRIM(lost_color)) =
-             LOWER(TRIM(found_color))
-          THEN 100
-
+        WHEN lost_radius_m + found_radius_m = 0 THEN CASE WHEN distance_m = 0 THEN 100 ELSE 0 END
+        ELSE ROUND(GREATEST(0, LEAST(100, 100 * (1 - distance_m / (lost_radius_m + found_radius_m))))::numeric, 2)
+      END AS location_score,
+      100::numeric AS category_score,
+      CASE
+        WHEN NULLIF(TRIM(lost_color), '') IS NULL OR NULLIF(TRIM(found_color), '') IS NULL THEN 50
+        WHEN LOWER(REGEXP_REPLACE(TRIM(lost_color), '[^[:alnum:]]+', ' ', 'g')) = LOWER(REGEXP_REPLACE(TRIM(found_color), '[^[:alnum:]]+', ' ', 'g')) THEN 100
         ELSE 0
       END AS color_score,
-
-      -- Model compatibility: unknown models are neutral; known conflicts score 0.
       CASE
-        WHEN NULLIF(TRIM(lost_model), '') IS NULL
-          OR NULLIF(TRIM(found_model), '') IS NULL
-          THEN 50
-
-        WHEN LOWER(TRIM(lost_model)) = LOWER(TRIM(found_model))
-          THEN 100
-
+        WHEN lost_model IS NULL OR found_model IS NULL THEN 50
+        WHEN LOWER(REGEXP_REPLACE(TRIM(lost_model), '[^[:alnum:]]+', ' ', 'g')) = LOWER(REGEXP_REPLACE(TRIM(found_model), '[^[:alnum:]]+', ' ', 'g')) THEN 100
         ELSE 0
       END AS model_score,
-
-      -- Time proximity score: 0-100.
       CASE
+        WHEN lost_brand IS NULL OR found_brand IS NULL THEN 50
+        WHEN LOWER(REGEXP_REPLACE(TRIM(lost_brand), '[^[:alnum:]]+', ' ', 'g')) = LOWER(REGEXP_REPLACE(TRIM(found_brand), '[^[:alnum:]]+', ' ', 'g')) THEN 100
+        ELSE 0
+      END AS brand_score,
+      CASE
+        WHEN lost_brand IS NULL OR found_brand IS NULL THEN
+          CASE WHEN lost_model IS NULL OR found_model IS NULL THEN 50
+            WHEN LOWER(REGEXP_REPLACE(TRIM(lost_model), '[^[:alnum:]]+', ' ', 'g')) = LOWER(REGEXP_REPLACE(TRIM(found_model), '[^[:alnum:]]+', ' ', 'g')) THEN 100 ELSE 0 END
+        WHEN lost_model IS NULL OR found_model IS NULL THEN
+          CASE WHEN LOWER(REGEXP_REPLACE(TRIM(lost_brand), '[^[:alnum:]]+', ' ', 'g')) = LOWER(REGEXP_REPLACE(TRIM(found_brand), '[^[:alnum:]]+', ' ', 'g')) THEN 100 ELSE 0 END
+        ELSE ROUND((
+          CASE WHEN LOWER(REGEXP_REPLACE(TRIM(lost_brand), '[^[:alnum:]]+', ' ', 'g')) = LOWER(REGEXP_REPLACE(TRIM(found_brand), '[^[:alnum:]]+', ' ', 'g')) THEN 100 ELSE 0 END
+          + CASE WHEN LOWER(REGEXP_REPLACE(TRIM(lost_model), '[^[:alnum:]]+', ' ', 'g')) = LOWER(REGEXP_REPLACE(TRIM(found_model), '[^[:alnum:]]+', ' ', 'g')) THEN 100 ELSE 0 END
+        )::numeric / 2, 2)
+      END AS brand_model_score,
+      (
+        (lost_brand IS NOT NULL AND found_brand IS NOT NULL
+          AND LOWER(REGEXP_REPLACE(TRIM(lost_brand), '[^[:alnum:]]+', ' ', 'g')) = LOWER(REGEXP_REPLACE(TRIM(found_brand), '[^[:alnum:]]+', ' ', 'g')))
+        OR (lost_model IS NOT NULL AND found_model IS NOT NULL
+          AND LOWER(REGEXP_REPLACE(TRIM(lost_model), '[^[:alnum:]]+', ' ', 'g')) = LOWER(REGEXP_REPLACE(TRIM(found_model), '[^[:alnum:]]+', ' ', 'g')))
+      ) AS brand_model_match_evidence,
+      CASE
+        WHEN NOT isfinite(lost_report_time) OR NOT isfinite(found_report_time) THEN 50
         WHEN days_apart <= 1 THEN 100
         WHEN days_apart <= 7 THEN 80
         WHEN days_apart <= 30 THEN 50
         WHEN days_apart <= 90 THEN 25
         ELSE 0
       END AS time_score,
-
-      -- Title similarity: intersection / union of distinct words.
-      CASE
-        WHEN lost_title_norm = ''
-          OR found_title_norm = ''
-          THEN 0
-
-        ELSE ROUND(
-          (
-            100.0 * (
-              SELECT COUNT(*)
-              FROM (
-                SELECT DISTINCT word
-                FROM UNNEST(
-                  REGEXP_SPLIT_TO_ARRAY(
-                    lost_title_norm,
-                    '\\s+'
-                  )
-                ) AS word
-                WHERE LENGTH(word) > 1
-
-                INTERSECT
-
-                SELECT DISTINCT word
-                FROM UNNEST(
-                  REGEXP_SPLIT_TO_ARRAY(
-                    found_title_norm,
-                    '\\s+'
-                  )
-                ) AS word
-                WHERE LENGTH(word) > 1
-              ) shared_words
-            )
-            /
-            NULLIF(
-              (
-                SELECT COUNT(*)
-                FROM (
-                  SELECT DISTINCT word
-                  FROM UNNEST(
-                    REGEXP_SPLIT_TO_ARRAY(
-                      lost_title_norm,
-                      '\\s+'
-                    )
-                  ) AS word
-                  WHERE LENGTH(word) > 1
-
-                  UNION
-
-                  SELECT DISTINCT word
-                  FROM UNNEST(
-                    REGEXP_SPLIT_TO_ARRAY(
-                      found_title_norm,
-                      '\\s+'
-                    )
-                  ) AS word
-                  WHERE LENGTH(word) > 1
-                ) all_words
-              ),
-              0
-            )
-          )::numeric,
-          2
-        )
-      END AS title_score,
-
-      -- Description similarity using combined title + description text.
-      CASE
-        WHEN lost_normalized_text = ''
-          OR found_normalized_text = ''
-          THEN 0
-
-        ELSE ROUND(
-          (
-            100.0 * (
-              SELECT COUNT(*)
-              FROM (
-                SELECT DISTINCT word
-                FROM UNNEST(
-                  REGEXP_SPLIT_TO_ARRAY(
-                    lost_normalized_text,
-                    '\\s+'
-                  )
-                ) AS word
-                WHERE LENGTH(word) > 1
-
-                INTERSECT
-
-                SELECT DISTINCT word
-                FROM UNNEST(
-                  REGEXP_SPLIT_TO_ARRAY(
-                    found_normalized_text,
-                    '\\s+'
-                  )
-                ) AS word
-                WHERE LENGTH(word) > 1
-              ) shared_words
-            )
-            /
-            NULLIF(
-              (
-                SELECT COUNT(*)
-                FROM (
-                  SELECT DISTINCT word
-                  FROM UNNEST(
-                    REGEXP_SPLIT_TO_ARRAY(
-                      lost_normalized_text,
-                      '\\s+'
-                    )
-                  ) AS word
-                  WHERE LENGTH(word) > 1
-
-                  UNION
-
-                  SELECT DISTINCT word
-                  FROM UNNEST(
-                    REGEXP_SPLIT_TO_ARRAY(
-                      found_normalized_text,
-                      '\\s+'
-                    )
-                  ) AS word
-                  WHERE LENGTH(word) > 1
-                ) all_words
-              ),
-              0
-            )
-          )::numeric,
-          2
-        )
-      END AS description_score
-
-    FROM text_features
-  ), scored_candidates AS (
+      CASE WHEN title_union_count = 0 THEN 0 ELSE ROUND((100.0 * title_shared_count / title_union_count)::numeric, 2) END AS title_score,
+      CASE WHEN description_union_count = 0 THEN 0 ELSE ROUND((100.0 * description_shared_count / description_union_count)::numeric, 2) END AS description_score
+    FROM text_counts
+  ),
+  scored_candidates AS (
     SELECT
-    lost_report_id,
-    found_report_id,
-
-    lost_title,
-    found_title,
-
-    lost_report_time,
-    found_report_time,
-
-    lost_category,
-    found_category,
-
-    ROUND(distance_m::numeric, 2) AS distance_m,
-
-    lost_radius_m,
-    found_radius_m,
-
-    circles_overlap,
-    ROUND(days_apart::numeric, 2) AS days_apart,
-
-    location_score,
-    category_score,
-    color_score,
-    model_score,
-    time_score,
-    title_score,
-    description_score,
-
-    ROUND(
-      (
-         location_score * 0.40
-        + category_score * 0.15
-        + color_score * 0.10
-        + time_score * 0.15
-        + title_score * 0.05
-        + description_score * 0.05
-        + model_score * 0.10
-      )::numeric,
-      2
-    ) AS total_score
-
+      lost_report_id,
+      found_report_id,
+      lost_title,
+      lost_report_time,
+      found_report_time,
+      lost_category,
+      found_category,
+      ROUND(distance_m::numeric, 2) AS distance_m,
+      lost_radius_m,
+      found_radius_m,
+      circles_overlap,
+      ROUND(days_apart::numeric, 2) AS days_apart,
+      location_score,
+      category_score,
+      color_score,
+      model_score,
+      brand_score,
+      brand_model_score,
+      brand_model_match_evidence,
+      time_score,
+      title_score,
+      description_score,
+      ${itemScoreSql} AS item_score,
+      ROUND((${totalScoreSql})::numeric, 2) AS total_score
     FROM scored
-
-    -- Geographic compatibility is checked after item filtering.
     WHERE circles_overlap = TRUE
   )
 
   SELECT *
   FROM scored_candidates
   WHERE total_score >= ${MATCH_SCORE_THRESHOLD}
+    -- Location, time, category, and unknown neutral factors alone are not identifying evidence.
+    AND (title_score > 0 OR description_score > 0 OR brand_model_match_evidence = TRUE)
   ORDER BY total_score DESC, distance_m ASC
   LIMIT 100
 `;
@@ -509,6 +347,15 @@ router.get("/", async (req, res) => {
         matchScore: Number(match.total_score),
         matchStrength: getMatchStrength(Number(match.total_score)),
         modelScore: Number(match.model_score),
+        scoreBreakdown: {
+          location: Number(match.location_score),
+          category: Number(match.category_score),
+          color: Number(match.color_score),
+          time: Number(match.time_score),
+          title: Number(match.title_score),
+          description: Number(match.description_score),
+          brandModel: Number(match.brand_model_score),
+        },
         category: match.lost_category,
         lostTitle: match.lost_title,
         lostReportTime: match.lost_report_time,
@@ -516,7 +363,7 @@ router.get("/", async (req, res) => {
         matchedAt: match.matched_at,
         approximateDistanceM:
           Math.round(Number(match.distance_m) / 100) * 100,
-        daysApart: Number(match.days_apart),
+        daysApart: match.days_apart == null ? null : Number(match.days_apart),
         status: match.saved_match_status || "CANDIDATE",
         canClaim: match.saved_match_id != null && match.found_available_to_claim &&
           ["CANDIDATE", "CHAT_ENABLED"].includes(match.saved_match_status || "CANDIDATE"),
@@ -575,6 +422,8 @@ router.post("/refresh", async (req, res) => {
         category_score: Number(match.category_score),
         color_score: Number(match.color_score),
         model_score: Number(match.model_score),
+        brand_score: Number(match.brand_score),
+        brand_model_score: Number(match.brand_model_score),
         title_score: Number(match.title_score),
         description_score: Number(match.description_score),
         distance_m: Number(match.distance_m),
@@ -615,7 +464,7 @@ router.post("/refresh", async (req, res) => {
           match.lost_report_id,
           match.found_report_id,
           match.location_score,
-          match.category_score,
+          match.item_score,
           match.time_score,
           match.description_score,
           match.total_score,

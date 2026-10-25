@@ -12,14 +12,16 @@ function authorizedTargetSql(userParameter = "$1") {
       JOIN reports lost ON lost.report_id = m.lost_report_id
       WHERE m.match_id = n.reference_id AND lost.user_id = ${userParameter}
     ) THEN '#my-matches'
-    WHEN n.reference_type IN ('CLAIM', 'MESSAGE', 'PROOF_REQUEST') AND EXISTS (
+    WHEN n.reference_type IN ('CLAIM', 'MESSAGE', 'PROOF_REQUEST', 'CLAIM_VERIFICATION', 'HANDOVER_CODE') AND EXISTS (
       SELECT 1 FROM claim_requests c
       JOIN match_records m ON m.match_id = c.match_id
       JOIN reports found ON found.report_id = m.found_report_id
       WHERE c.claim_id = CASE n.reference_type
         WHEN 'CLAIM' THEN n.reference_id
         WHEN 'MESSAGE' THEN (SELECT v.claim_id FROM messages msg JOIN conversations v USING(conversation_id) WHERE msg.message_id=n.reference_id)
-        ELSE (SELECT v.claim_id FROM conversation_proof_requests pr JOIN conversations v USING(conversation_id) WHERE pr.proof_request_id=n.reference_id)
+        WHEN 'PROOF_REQUEST' THEN (SELECT v.claim_id FROM conversation_proof_requests pr JOIN conversations v USING(conversation_id) WHERE pr.proof_request_id=n.reference_id)
+        WHEN 'CLAIM_VERIFICATION' THEN (SELECT cv.claim_id FROM claim_verifications cv WHERE cv.verification_id=n.reference_id)
+        WHEN 'HANDOVER_CODE' THEN (SELECT a.entity_id FROM audit_logs a WHERE a.audit_id=n.reference_id AND a.entity_type='CLAIM' AND a.action_type='HANDOVER_CODE_ISSUED')
       END
         AND (
           c.claimant_user_id = ${userParameter}

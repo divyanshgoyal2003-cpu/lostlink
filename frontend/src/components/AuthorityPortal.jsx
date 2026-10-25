@@ -45,14 +45,16 @@ function AuthorityReportPhotos({ token, reportId, photos = [] }) {
       }
     }
     if (photos.length) void load()
-    else setImages([])
     return () => { cancelled = true; urls.forEach((url) => URL.revokeObjectURL(url)) }
   }, [token, reportId, photos])
   if (!photos.length) return <p>No photos were uploaded for this report.</p>
+  const visibleImages = images.filter((image) =>
+    photos.some((photo) => String(photo.photoId) === String(image.photoId))
+  )
   return <div className="authority-report-photos" aria-label="Found item photos">
     {loading && <p role="status">Loading private report photos…</p>}
     {error && <p className="authority-photo-error" role="alert">{error}</p>}
-    {images.map((photo) => <figure key={photo.photoId}><img src={photo.url} alt={`${String(photo.photoType || 'Item').replaceAll('_', ' ').toLowerCase()} view of the found item`} /><figcaption>{String(photo.photoType || 'Item photo').replaceAll('_', ' ')}</figcaption></figure>)}
+    {visibleImages.map((photo) => <figure key={photo.photoId}><img src={photo.url} alt={`${String(photo.photoType || 'Item').replaceAll('_', ' ').toLowerCase()} view of the found item`} /><figcaption>{String(photo.photoType || 'Item photo').replaceAll('_', ' ')}</figcaption></figure>)}
   </div>
 }
 
