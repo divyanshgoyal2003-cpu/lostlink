@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { getClaimPhotoAccess, getPrivatePhoto, grantClaimPhotoAccess, revokeClaimPhotoAccess } from '../api'
 import './ClaimPhotoAccess.css'
 
-function ClaimPhotoAccess({ token, claimId, onRefresh }) {
+function ClaimPhotoAccess({ token, claimId, onRefresh, onStartChat, chatStarting = false, chatError = '', chatFeedback = '' }) {
   const [access, setAccess] = useState(null)
   const [photoUrls, setPhotoUrls] = useState([])
   const [loading, setLoading] = useState(true)
@@ -31,6 +31,15 @@ function ClaimPhotoAccess({ token, claimId, onRefresh }) {
 
   useEffect(() => {
     loadAccess()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, claimId])
+
+  useEffect(() => {
+    function refreshAfterChatOpens(event) {
+      if (String(event.detail?.claimId) === String(claimId)) void loadAccess()
+    }
+    window.addEventListener('lostlink:claim-conversation-opened', refreshAfterChatOpens)
+    return () => window.removeEventListener('lostlink:claim-conversation-opened', refreshAfterChatOpens)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token, claimId])
 
@@ -76,13 +85,22 @@ function ClaimPhotoAccess({ token, claimId, onRefresh }) {
       <div className="claim-photo-access-heading">
         <strong>Found-item photos: {access?.sharingStatus === 'SHARED' ? 'Shared for this claim' : 'Private'}</strong>
         {access?.sharingStatus === 'SHARED' && <small>The claimant on this claim can view these photos securely.</small>}
-        {access?.canManage && access?.sharingStatus !== 'SHARED' && !access?.conversationOpen && <small>Enable chat for this claim before sharing photos.</small>}
+        {access?.canManage && access?.sharingStatus !== 'SHARED' && !access?.conversationOpen && <small>Start a chat with the claimant first. Photos stay private until you share them separately below.</small>}
         {access?.canManage && access?.sharingStatus !== 'SHARED' && access?.conversationOpen && !access?.requiredViewsComplete && <small>Complete the Front, Back, and Side capture before sharing.</small>}
         {!access?.canManage && access?.sharingStatus !== 'SHARED' && <small>The finder or assigned authority must explicitly share photos for this claim.</small>}
       </div>
       <button type="button" className="btn btn-secondary" disabled={loading || pending} onClick={loadAccess}>
         {loading ? 'Refreshing…' : 'Refresh photo access'}
       </button>
+      {access?.canManage && access?.sharingStatus !== 'SHARED' && !access?.conversationOpen && onStartChat && (
+        <div className="claim-photo-chat-action">
+          <button type="button" className="btn btn-primary" disabled={chatStarting} onClick={onStartChat}>
+            {chatStarting ? 'Starting chat…' : 'Start chat with claimant'}
+          </button>
+          {chatError && <p className="auth-error" role="alert">{chatError}</p>}
+          {chatFeedback && <p className="claim-feedback" role="status">{chatFeedback}</p>}
+        </div>
+      )}
       {access?.photos?.length > 0 && photoUrls.length > 0 && (
         <div className="claim-photo-gallery">
           {photoUrls.map((photo) => (

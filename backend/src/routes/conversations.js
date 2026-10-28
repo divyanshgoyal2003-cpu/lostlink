@@ -2,7 +2,7 @@ const express = require("express");
 const pool = require("../config/db");
 const authenticateToken = require("../middleware/auth");
 const { createNotification } = require("../notifications");
-const { currentUser } = require("../authorityAccess");
+const { currentUser, isCurrentAdmin } = require("../authorityAccess");
 
 const router = express.Router();
 router.use((req, res, next) => {
@@ -67,8 +67,16 @@ router.get("/claims/:claimId", async (req, res) => {
   try {
     const context = await loadContext(pool, claimId, req.user.userId);
     if (!context) return res.status(403).json({ error: "Conversation is not available to this account" });
+    // Keep conversation history readable while an additive moderation migration is being rolled out.
+    // Reporting is unavailable until migration 006 exists; this fallback never grants extra access.
+    const reportTable = await pool.query("SELECT to_regclass('public.chat_user_reports') IS NOT NULL AS available");
+    const reportedByYouExpression = reportTable.rows[0].available
+      ? `EXISTS (SELECT 1 FROM chat_user_reports cr
+                 WHERE cr.message_id=m.message_id AND cr.reporter_user_id=$4)`
+      : "($4::bigint IS NOT NULL AND FALSE)";
     const messages = await pool.query(
       `SELECT m.message_id, m.message_body, m.sent_at, u.name AS sender_name, m.sender_user_id,
+              ${reportedByYouExpression} AS reported_by_you,
               EXISTS (SELECT 1 FROM conversation_read_states rs
                       WHERE rs.conversation_id=m.conversation_id AND rs.user_id<>m.sender_user_id
                         AND rs.last_read_message_id>=m.message_id) AS read_by_other
@@ -77,7 +85,7 @@ router.get("/claims/:claimId", async (req, res) => {
        JOIN users u ON u.user_id=m.sender_user_id
        WHERE conv.claim_id=$1 AND ($2::bigint IS NULL OR m.message_id<$2)
        ORDER BY m.message_id DESC LIMIT $3`,
-      [claimId, beforeId, limit]
+      [claimId, beforeId, limit, req.user.userId]
     );
     messages.rows.reverse();
     const proofRequests = await pool.query(
@@ -117,12 +125,216 @@ router.get("/claims/:claimId", async (req, res) => {
         sentAt: message.sent_at,
         body: message.message_body,
         isYou: Number(message.sender_user_id) === Number(req.user.userId),
+        reportedByYou: message.reported_by_you,
         readByOther: message.read_by_other,
       })),
     });
   } catch (error) {
     console.error("Read claim conversation failed.");
     return res.status(500).json({ error: "Unable to load conversation" });
+  }
+});
+
+router.post("/claims/:claimId/user-reports", async (req, res) => {
+  const claimId = parseClaimId(req.params.claimId);
+  const messageId = parseClaimId(req.body?.messageId);
+  const category = req.body?.category;
+  const details = req.body?.details ?? "";
+  if (!claimId || !messageId || !["ABUSIVE_LANGUAGE", "RUDE_OR_HARASSING"].includes(category) ||
+      typeof details !== "string" || details.trim().length > 500) {
+    return res.status(400).json({ error: "Choose a valid report reason and message" });
+  }
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+    const context = await loadContext(client, claimId, req.user.userId, true);
+    if (!context) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "You cannot report messages in this conversation" });
+    }
+    const message = await client.query(
+      `SELECT m.sender_user_id
+       FROM messages m
+       WHERE m.message_id=$1 AND m.conversation_id=$2
+       FOR UPDATE`,
+      [messageId, context.row.conversation_id]
+    );
+    if (!message.rowCount || Number(message.rows[0].sender_user_id) === req.user.userId) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Message not found" });
+    }
+    const reportedUserId = message.rows[0].sender_user_id;
+    const reportedUser = await client.query(
+      "SELECT account_status FROM users WHERE user_id=$1 FOR UPDATE",
+      [reportedUserId]
+    );
+    if (!reportedUser.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Message author not found" });
+    }
+    const inserted = await client.query(
+      `INSERT INTO chat_user_reports
+         (reporter_user_id, reported_user_id, conversation_id, message_id, report_category, report_details)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (reporter_user_id, reported_user_id, message_id) DO NOTHING
+       RETURNING chat_user_report_id`,
+      [req.user.userId, reportedUserId, context.row.conversation_id, messageId, category, details.trim() || null]
+    );
+    if (!inserted.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "You already reported this message" });
+    }
+    const reportCount = await client.query(
+      `SELECT COUNT(DISTINCT reporter_user_id)::int AS count
+       FROM chat_user_reports WHERE reported_user_id=$1 AND report_status='OPEN'`,
+      [reportedUserId]
+    );
+    await client.query(
+      `INSERT INTO audit_logs (actor_user_id, action_type, entity_type, entity_id, metadata)
+       VALUES ($1,'CHAT_USER_REPORTED','CHAT_USER_REPORT',$2,$3::jsonb)`,
+      [req.user.userId, inserted.rows[0].chat_user_report_id,
+        JSON.stringify({ category, conversationId: context.row.conversation_id, messageId })]
+    );
+    if (reportCount.rows[0].count >= 5 && reportedUser.rows[0].account_status === "ACTIVE") {
+      const update = await client.query(
+        "UPDATE users SET account_status='SUSPENDED' WHERE user_id=$1 AND account_status='ACTIVE' RETURNING user_id",
+        [reportedUserId]
+      );
+      if (update.rowCount) {
+        await client.query(
+          `INSERT INTO audit_logs (actor_user_id, action_type, entity_type, entity_id, metadata)
+           VALUES ($1,'CHAT_USER_AUTO_SUSPENDED','USER',$2,$3::jsonb)`,
+          [req.user.userId, reportedUserId, JSON.stringify({ distinctReports: reportCount.rows[0].count, threshold: 5 })]
+        );
+      }
+    }
+    await client.query("COMMIT");
+    return res.status(201).json({ submitted: true });
+  } catch (error) {
+    if (client) try { await client.query("ROLLBACK"); } catch { /* preserve original result */ }
+    console.error("Submit chat user report failed.", {
+      code: error.code || "UNEXPECTED_ERROR",
+      table: error.table || undefined,
+      constraint: error.constraint || undefined,
+    });
+    return res.status(500).json({ error: "Unable to submit report" });
+  } finally {
+    client?.release();
+  }
+});
+
+router.get("/moderation/reports", async (req, res) => {
+  try {
+    if (!(await isCurrentAdmin(pool, req.user.userId))) return res.status(403).json({ error: "Administrator access required" });
+    const result = await pool.query(
+      `SELECT target.user_id AS reported_user_id, target.name AS reported_name,
+              target.email AS reported_email, target.account_status,
+              COUNT(DISTINCT report.reporter_user_id) FILTER (WHERE report.report_status='OPEN')::int AS distinct_reporters,
+              json_agg(json_build_object(
+                'reportId', report.chat_user_report_id,
+                'category', report.report_category,
+                'details', report.report_details,
+                'createdAt', report.created_at,
+                'reporterName', reporter.name,
+                'message', message.message_body,
+                'claimId', conversation.claim_id
+              ) ORDER BY report.created_at) FILTER (WHERE report.report_status='OPEN') AS reports
+       FROM chat_user_reports report
+       JOIN users target ON target.user_id=report.reported_user_id
+       JOIN users reporter ON reporter.user_id=report.reporter_user_id
+       JOIN messages message ON message.message_id=report.message_id
+       JOIN conversations conversation ON conversation.conversation_id=report.conversation_id
+       GROUP BY target.user_id, target.name, target.email, target.account_status
+       HAVING COUNT(*) FILTER (WHERE report.report_status='OPEN') > 0 OR target.account_status='SUSPENDED'
+       ORDER BY COUNT(DISTINCT report.reporter_user_id) DESC, target.user_id`);
+    return res.json({ users: result.rows });
+  } catch (error) {
+    console.error("Get chat moderation queue failed.");
+    return res.status(500).json({ error: "Unable to retrieve moderation reports" });
+  }
+});
+
+router.patch("/moderation/reports/:reportId/dismiss", async (req, res) => {
+  const reportId = parseClaimId(req.params.reportId);
+  if (!reportId) return res.status(400).json({ error: "A valid report ID is required" });
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+    if (!(await isCurrentAdmin(client, req.user.userId))) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Administrator access required" });
+    }
+    const reportOwner = await client.query(
+      "SELECT reported_user_id FROM chat_user_reports WHERE chat_user_report_id=$1 FOR UPDATE",
+      [reportId]
+    );
+    if (!reportOwner.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Open report not found" });
+    }
+    await client.query("SELECT user_id FROM users WHERE user_id=$1 FOR UPDATE", [reportOwner.rows[0].reported_user_id]);
+    const dismissed = await client.query(
+      `UPDATE chat_user_reports SET report_status='DISMISSED', reviewed_by_user_id=$2, reviewed_at=NOW()
+       WHERE chat_user_report_id=$1 AND report_status='OPEN'
+       RETURNING reported_user_id`,
+      [reportId, req.user.userId]
+    );
+    if (!dismissed.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Open report not found" });
+    }
+    await client.query(
+      `INSERT INTO audit_logs (actor_user_id, action_type, entity_type, entity_id, metadata)
+       VALUES ($1,'CHAT_USER_REPORT_DISMISSED','CHAT_USER_REPORT',$2,'{}'::jsonb)`,
+      [req.user.userId, reportId]
+    );
+    await client.query("COMMIT");
+    return res.json({ dismissed: true, reportedUserId: String(dismissed.rows[0].reported_user_id) });
+  } catch (error) {
+    if (client) try { await client.query("ROLLBACK"); } catch { /* preserve original result */ }
+    console.error("Dismiss chat user report failed.");
+    return res.status(500).json({ error: "Unable to dismiss report" });
+  } finally {
+    client?.release();
+  }
+});
+
+router.post("/moderation/users/:userId/reinstate", async (req, res) => {
+  const userId = parseClaimId(req.params.userId);
+  if (!userId) return res.status(400).json({ error: "A valid user ID is required" });
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+    if (!(await isCurrentAdmin(client, req.user.userId))) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Administrator access required" });
+    }
+    const target = await client.query("SELECT account_status FROM users WHERE user_id=$1 FOR UPDATE", [userId]);
+    if (!target.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "User not found" });
+    }
+    if (target.rows[0].account_status !== "SUSPENDED") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "This account is not suspended" });
+    }
+    await client.query("UPDATE users SET account_status='ACTIVE' WHERE user_id=$1", [userId]);
+    await client.query(
+      `INSERT INTO audit_logs (actor_user_id, action_type, entity_type, entity_id, metadata)
+       VALUES ($1,'CHAT_USER_REINSTATED','USER',$2,'{}'::jsonb)`,
+      [req.user.userId, userId]
+    );
+    await client.query("COMMIT");
+    return res.json({ reinstated: true });
+  } catch (error) {
+    if (client) try { await client.query("ROLLBACK"); } catch { /* preserve original result */ }
+    console.error("Reinstate user failed.");
+    return res.status(500).json({ error: "Unable to reinstate account" });
+  } finally {
+    client?.release();
   }
 });
 

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { createProofRequest, downloadConversationProof, getClaimConversation, markConversationRead, reviewProofRequest, sendClaimConversationMessage, uploadConversationProof } from '../api'
+import { createProofRequest, downloadConversationProof, getClaimConversation, markConversationRead, reportChatUser, reviewProofRequest, sendClaimConversationMessage, uploadConversationProof } from '../api'
 import { startConversationPolling } from '../conversationPolling'
 import './ConversationPanel.css'
+import './ChatModeration.css'
 
 function ConversationPanel({ token, claimId, title = 'Conversation' }) {
   const [messages, setMessages] = useState([])
@@ -16,6 +17,12 @@ function ConversationPanel({ token, claimId, title = 'Conversation' }) {
   const [uploading, setUploading] = useState('')
   const [hasMore, setHasMore] = useState(false)
   const [pendingMessageId, setPendingMessageId] = useState('')
+  const [reportingMessageId, setReportingMessageId] = useState('')
+  const [reportCategory, setReportCategory] = useState('ABUSIVE_LANGUAGE')
+  const [reportDetails, setReportDetails] = useState('')
+  const [reporting, setReporting] = useState(false)
+  const [reportMessage, setReportMessage] = useState('')
+  const [reportError, setReportError] = useState('')
   const lastReadMessageId = useRef('')
 
   const load = useCallback(async () => {
@@ -107,6 +114,31 @@ function ConversationPanel({ token, claimId, title = 'Conversation' }) {
     catch (statusError) { setError(statusError.message || 'Could not update proof request.') }
   }
 
+  async function submitUserReport(event, message) {
+    event.preventDefault()
+    if (reporting) return
+    setReporting(true)
+    setReportError('')
+    setReportMessage('')
+    try {
+      await reportChatUser(token, claimId, {
+        messageId: message.messageId,
+        category: reportCategory,
+        details: reportDetails.trim(),
+      })
+      setMessages((current) => current.map((item) => String(item.messageId) === String(message.messageId)
+        ? { ...item, reportedByYou: true }
+        : item))
+      setReportingMessageId('')
+      setReportDetails('')
+      setReportMessage('Report submitted privately for review.')
+    } catch (submitError) {
+      setReportError(submitError.message || 'Could not submit this report.')
+    } finally {
+      setReporting(false)
+    }
+  }
+
   const timeline = [
     ...messages.map((message) => ({ ...message, type: 'MESSAGE', eventAt: message.sentAt })),
     ...proofRequests.map((request) => ({ ...request, type: 'PROOF_REQUEST', eventAt: request.createdAt })),
@@ -127,6 +159,38 @@ function ConversationPanel({ token, claimId, title = 'Conversation' }) {
             <article className={`conversation-message${entry.isYou ? ' is-you' : ''}`} key={`message-${entry.messageId}`}>
               <div><strong>{entry.isYou ? 'You' : entry.senderName}</strong><span><time dateTime={entry.sentAt}>{new Date(entry.sentAt).toLocaleString()}</time>{entry.isYou && <small>{entry.readByOther ? ' · Read' : ' · Sent'}</small>}</span></div>
               <p>{entry.body}</p>
+              {!entry.isYou && (
+                entry.reportedByYou
+                  ? <small className="chat-report-submitted">You reported this message.</small>
+                  : <div className="chat-report-control">
+                    <button
+                      type="button"
+                      className="chat-report-toggle"
+                      aria-expanded={reportingMessageId === String(entry.messageId)}
+                      onClick={() => {
+                        setReportingMessageId((current) => current === String(entry.messageId) ? '' : String(entry.messageId))
+                        setReportError('')
+                        setReportMessage('')
+                      }}
+                    >Report rude or abusive message</button>
+                    {reportingMessageId === String(entry.messageId) && (
+                      <form className="chat-report-form" onSubmit={(event) => void submitUserReport(event, entry)}>
+                        <p>Use this for cuss words, rude or harassing speech. Reports are private and reviewed by LostLink administrators.</p>
+                        <label htmlFor={`chat-report-reason-${entry.messageId}`}>Reason</label>
+                        <select id={`chat-report-reason-${entry.messageId}`} value={reportCategory} onChange={(event) => setReportCategory(event.target.value)}>
+                          <option value="ABUSIVE_LANGUAGE">Cuss words or abusive language</option>
+                          <option value="RUDE_OR_HARASSING">Rude or harassing behavior</option>
+                        </select>
+                        <label htmlFor={`chat-report-details-${entry.messageId}`}>Additional context (optional)</label>
+                        <textarea id={`chat-report-details-${entry.messageId}`} rows={2} maxLength={500} value={reportDetails} onChange={(event) => setReportDetails(event.target.value)} />
+                        <button className="btn btn-secondary" type="submit" disabled={reporting}>
+                          {reporting ? 'Submitting report…' : 'Submit report'}
+                        </button>
+                        {reportError && <p className="auth-error" role="alert">{reportError}</p>}
+                      </form>
+                    )}
+                  </div>
+              )}
             </article>
           ) : (
             <article className="conversation-message" key={`proof-${entry.requestId}`}>
@@ -146,6 +210,7 @@ function ConversationPanel({ token, claimId, title = 'Conversation' }) {
         <button className="btn btn-secondary" type="submit" disabled={sending || !proofText.trim()}>Request proof</button>
       </form>}
       {uploading && <p role="status">Uploading requested proof…</p>}
+      {reportMessage && <p className="claim-feedback" role="status">{reportMessage}</p>}
       {error && <p className="auth-error" role="alert">{error}</p>}
       <form onSubmit={send} className="claim-conversation-form">
         <label htmlFor={`conversation-message-${claimId}`}>Message</label>

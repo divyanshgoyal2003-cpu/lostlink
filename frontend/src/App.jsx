@@ -289,7 +289,6 @@ async function loadMyMatches({ refresh = false, lostReportId = appliedMatchFilte
 
   setMatchesLoading(true)
   setMatchesError('')
-  setMatchesMessage('')
 
   try {
     if (refresh) {
@@ -300,11 +299,6 @@ async function loadMyMatches({ refresh = false, lostReportId = appliedMatchFilte
     setMatchScoreThreshold(result.scoreThreshold ?? null)
     setStrongMatchThreshold(result.strongMatchThreshold ?? null)
 
-    if (!result.matches?.length) {
-      setMatchesMessage(
-        'No potential matches are available for your reports yet.'
-      )
-    }
     return true
   } catch (error) {
     setMatchesError(error.message || 'Could not load your matches.')

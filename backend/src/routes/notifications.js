@@ -132,6 +132,24 @@ router.post("/read-all", async (req, res) => {
   }
 })
 
+router.delete("/:notificationId", async (req, res) => {
+  const id = String(req.params.notificationId)
+  if (!/^[1-9]\d{0,18}$/.test(id)) {
+    return res.status(400).json({ error: "A valid notification ID is required" })
+  }
+  try {
+    const result = await pool.query(
+      "DELETE FROM notifications WHERE notification_id = $1 AND user_id = $2 RETURNING notification_id",
+      [id, req.user.userId]
+    )
+    if (!result.rowCount) return res.status(404).json({ error: "Notification not found" })
+    return res.json({ deleted: true })
+  } catch (error) {
+    console.error("Delete notification failed.")
+    return res.status(500).json({ error: "Unable to delete notification" })
+  }
+})
+
 router.delete("/", async (req, res) => {
   try {
     const result = await pool.query(

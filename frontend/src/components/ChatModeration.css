@@ -1,0 +1,17 @@
+.chat-report-control { margin-top: .45rem; }
+.chat-report-toggle { padding: 0; border: 0; background: transparent; color: #8f3a31; font: inherit; font-size: .78rem; font-weight: 700; text-decoration: underline; cursor: pointer; }
+.chat-report-form { display: grid; gap: .45rem; margin-top: .55rem; padding: .7rem; border-left: 3px solid #c98240; border-radius: 0 8px 8px 0; background: #fff8ef; }
+.chat-report-form p { margin: 0 0 .2rem; color: #684b37; font-size: .83rem; }
+.chat-report-form label { font-size: .82rem; font-weight: 700; }
+.chat-report-form select, .chat-report-form textarea { width: 100%; border: 1px solid #cfddd4; border-radius: 7px; padding: .55rem; font: inherit; background: #fff; }
+.chat-report-form textarea { resize: vertical; }
+.chat-report-form .btn { justify-self: start; }
+.chat-report-submitted { display: block; margin-top: .4rem; color: #5e6e64; font-size: .78rem; }
+.chat-moderation-panel { margin-bottom: 18px; }
+.chat-moderation-list { display: grid; gap: 14px; }
+.chat-moderation-user { padding: 16px; border: 1px solid #e1e9e4; border-radius: 12px; }
+.chat-moderation-user > p { margin: 8px 0; }
+.chat-moderation-report { display: grid; gap: 6px; margin-top: 10px; padding: 12px; border-top: 1px solid #edf1ee; }
+.chat-moderation-report > p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.chat-moderation-report small { color: #66766e; }
+.chat-moderation-report .btn, .chat-moderation-user > .btn { justify-self: start; }

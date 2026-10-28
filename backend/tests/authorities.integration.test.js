@@ -384,11 +384,6 @@ test("authority members review claims only after custody and final release uses 
     method: "POST", token: unrelated.token,
   });
   assert.equal(unrelatedCannotEnableAuthorityChat.status, 403);
-  const authorityEnabledChat = await api(`/api/claims/${claimId}/conversation/open`, {
-    method: "POST", token: assigned.member.token,
-  });
-  assert.equal(authorityEnabledChat.status, 200, await authorityEnabledChat.clone().text());
-  assert.equal((await authorityEnabledChat.json()).conversationStatus, "OPEN");
   const verification = await api(`/api/claims/${claimId}/verifications`, {
     method: "POST", token: assigned.member.token,
     body: JSON.stringify({ verificationType: "AUTHORITY_REVIEW", status: "PASSED", privateNote: "authority test note" }),
@@ -396,6 +391,18 @@ test("authority members review claims only after custody and final release uses 
   assert.equal(verification.status, 201, await verification.clone().text());
   const review = await api(`/api/claims/${claimId}/review`, { method: "PATCH", token: assigned.member.token, body: JSON.stringify({ decision: "APPROVED" }) });
   assert.equal(review.status, 200, await review.clone().text());
+  const approvedQueue = await api("/api/claims/review-queue", { token: assigned.member.token });
+  const approvedQueueBody = await approvedQueue.json();
+  assert.equal(approvedQueue.status, 200);
+  assert.ok(approvedQueueBody.claims.some((item) => Number(item.claim_id) === claimId && item.claim_status === "APPROVED"));
+  const authorityEnabledChat = await api(`/api/claims/${claimId}/conversation/open`, {
+    method: "POST", token: assigned.member.token,
+  });
+  assert.equal(authorityEnabledChat.status, 200, await authorityEnabledChat.clone().text());
+  assert.equal((await authorityEnabledChat.json()).conversationStatus, "OPEN");
+  const approvedChatQueue = await api("/api/claims/review-queue", { token: assigned.member.token });
+  const approvedChatQueueBody = await approvedChatQueue.json();
+  assert.ok(approvedChatQueueBody.claims.some((item) => Number(item.claim_id) === claimId && item.conversation_status === "OPEN"));
   const codeResponse = await api(`/api/claims/${claimId}/handover/code`, { method: "POST", token: lostUser.token });
   assert.equal(codeResponse.status, 201, await codeResponse.clone().text());
   const releaseCode = (await codeResponse.json()).code;
@@ -494,10 +501,10 @@ test("assigned authority can read claim photo state after custody while photos r
       [foundItem.rows[0].item_id, `authority-test-${claimId}-${photoType}.png`, photoType]
     );
   }
-  await pool.query(
-    "INSERT INTO conversations (claim_id, conversation_status) VALUES ($1, 'OPEN') ON CONFLICT (claim_id) DO UPDATE SET conversation_status='OPEN'",
-    [claimId]
-  );
+  const openedConversation = await api(`/api/claims/${claimId}/conversation/open`, {
+    method: "POST", token: assigned.member.token,
+  });
+  assert.equal(openedConversation.status, 200, await openedConversation.clone().text());
   const ready = await api(`/api/claims/${claimId}/photos`, { token: assigned.member.token });
   const readyBody = await ready.json();
   assert.equal(readyBody.sharingStatus, "PRIVATE");

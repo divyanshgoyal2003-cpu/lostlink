@@ -50,6 +50,8 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hi
   const [history, setHistory] = useState({})
   const [historyLoading, setHistoryLoading] = useState('')
   const [issuedCodes, setIssuedCodes] = useState({})
+  const [hiddenIssuedCodes, setHiddenIssuedCodes] = useState({})
+  const [handoverClockNow, setHandoverClockNow] = useState(Date.now())
   const [codeInputs, setCodeInputs] = useState({})
   const [reviewOptions, setReviewOptions] = useState({})
 
@@ -71,6 +73,35 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hi
       .catch(() => { if (active) setHasAuthorityMembership(false) })
     return () => { active = false }
   }, [token])
+
+  useEffect(() => {
+    const expiries = claims
+      .filter((claim) => claim.handover_status === 'CODE_ISSUED')
+      .map((claim) => Date.parse(claim.handover_code_expires_at))
+      .filter((expiry) => Number.isFinite(expiry) && expiry > handoverClockNow)
+    if (!expiries.length) return undefined
+
+    const nextExpiry = Math.min(...expiries)
+    const timer = window.setTimeout(() => {
+      const now = Date.now()
+      const expiredClaimIds = new Set(claims
+        .filter((claim) => {
+          const expiry = Date.parse(claim.handover_code_expires_at)
+          return Number.isFinite(expiry) && expiry <= now
+        })
+        .map((claim) => String(claim.claim_id)))
+      setHandoverClockNow(now)
+      if (expiredClaimIds.size) {
+        setIssuedCodes((previous) => Object.fromEntries(
+          Object.entries(previous).filter(([claimId]) => !expiredClaimIds.has(claimId)),
+        ))
+        setHiddenIssuedCodes((previous) => Object.fromEntries(
+          Object.entries(previous).filter(([claimId]) => !expiredClaimIds.has(claimId)),
+        ))
+      }
+    }, Math.min(Math.max(nextExpiry - handoverClockNow + 50, 50), 2_147_000_000))
+    return () => window.clearTimeout(timer)
+  }, [claims, handoverClockNow])
 
   async function loadClaims() {
     if (!token) {
@@ -114,6 +145,7 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hi
     onClaimsChange?.([], false)
     setReviewQueue([])
     setIssuedCodes({})
+    setHiddenIssuedCodes({})
     setCodeInputs({})
     setActionErrors({})
     setFeedback({})
@@ -137,8 +169,10 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hi
       if (successMessage) {
         setFeedback((previous) => ({ ...previous, [key]: successMessage }))
       }
+      return true
     } catch (error) {
       setActionErrors((previous) => ({ ...previous, [key]: readableError(error) }))
+      return false
     } finally {
       setPendingAction('')
     }
@@ -195,8 +229,9 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hi
     const key = `issue-code-${id}`
     await runAction(key, async () => {
       const result = await issueHandoverCode(token, id)
-      // Keep the one-time code in component memory only while it is being displayed.
+      // Keep the code only in this session's component memory; never persist it.
       updateById(setIssuedCodes, id, result.code)
+      updateById(setHiddenIssuedCodes, id, false)
       await loadClaims()
     }, 'Your one-time code is ready. Show it only to the person handing the item to you; it expires in 15 minutes.')
   }
@@ -205,12 +240,13 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hi
     const id = claim.claim_id
     const key = `confirm-${id}`
     const code = codeInputs[id] || ''
-    await runAction(key, async () => {
+    const confirmed = await runAction(key, async () => {
       await confirmHandover(token, id, code)
       updateById(setIssuedCodes, id, '')
+      updateById(setHiddenIssuedCodes, id, false)
       await Promise.all([refreshWorkflow(), onRefresh?.()])
     }, 'Handover confirmed. The claim and related report statuses are updated.')
-    updateById(setCodeInputs, id, '')
+    if (confirmed) updateById(setCodeInputs, id, '')
   }
 
   return (
@@ -245,6 +281,11 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hi
               const id = claim.claim_id
               const relationship = claim.current_user_relationship
               const actionKey = `claim-${id}`
+              const handoverCodeExpiresAt = Date.parse(claim.handover_code_expires_at)
+              const serverCodeActive = claim.handover_status === 'CODE_ISSUED' &&
+                Number.isFinite(handoverCodeExpiresAt) && handoverCodeExpiresAt > handoverClockNow
+              const localCodeActive = Boolean(issuedCodes[id]) &&
+                (!Number.isFinite(handoverCodeExpiresAt) || handoverCodeExpiresAt > handoverClockNow)
               return (
                 <article className="my-report-card claim-card" key={id}>
                   <div className="my-report-card-top">
@@ -259,23 +300,17 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hi
                   <p className="claim-next-step">{claim.authority_custody_received && relationship === 'FOUND_REPORT_OWNER'
                     ? 'The assigned authority has physical custody and manages claimant release.'
                     : describeClaimStatus(claim.claim_status, relationship === 'CLAIMANT' && claim.authority_custody_received ? 'AUTHORITY_CLAIMANT' : relationship, claim.found_recovery_mode)}</p>
-                  <ClaimPhotoAccess token={token} claimId={id} onRefresh={onRefresh} />
-                  {relationship === 'FOUND_REPORT_OWNER' && claim.found_recovery_mode === 'DIRECT' &&
-                    ['SUBMITTED', 'IN_REVIEW', 'APPROVED'].includes(claim.claim_status) &&
-                    claim.conversation_status !== 'OPEN' && claim.conversation_status !== 'CLOSED' && (
-                      <div className="claim-chat-action">
-                        <button
-                          type="button"
-                          className="btn btn-primary"
-                          disabled={pendingAction === `enable-chat-${id}`}
-                          onClick={() => handleEnableChat(claim)}
-                        >
-                          {pendingAction === `enable-chat-${id}` ? 'Enabling chat…' : 'Enable chat for this claim'}
-                        </button>
-                        {actionErrors[`enable-chat-${id}`] && <p className="auth-error" role="alert">{actionErrors[`enable-chat-${id}`]}</p>}
-                        {feedback[`enable-chat-${id}`] && <p className="claim-feedback" role="status">{feedback[`enable-chat-${id}`]}</p>}
-                      </div>
-                    )}
+                  <ClaimPhotoAccess
+                    token={token}
+                    claimId={id}
+                    onRefresh={onRefresh}
+                    onStartChat={relationship === 'FOUND_REPORT_OWNER' && claim.found_recovery_mode === 'DIRECT' &&
+                      ['SUBMITTED', 'IN_REVIEW', 'APPROVED'].includes(claim.claim_status) &&
+                      claim.conversation_status !== 'CLOSED' ? () => handleEnableChat(claim) : undefined}
+                    chatStarting={pendingAction === `enable-chat-${id}`}
+                    chatError={actionErrors[`enable-chat-${id}`]}
+                    chatFeedback={feedback[`enable-chat-${id}`]}
+                  />
                   {relationship === 'CLAIMANT' && claim.conversation_status !== 'OPEN' &&
                     ['SUBMITTED', 'IN_REVIEW', 'APPROVED'].includes(claim.claim_status) && (
                       <p className="claim-chat-note" role="status">
@@ -303,12 +338,17 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hi
                   {claim.claim_status === 'APPROVED' && relationship === 'CLAIMANT' && (
                     <div className="claim-handover-box claim-code-form">
                       <p>Get your private one-time code after approval and show it to the finder{claim.found_recovery_mode === 'AUTHORITY' ? ' or assigned authority' : ''} when you receive the item. It expires in 15 minutes and can be used once.</p>
-                      {issuedCodes[id] ? <div className="handover-code-display" role="status" aria-live="polite">
-                        <span>Show this code to the person handing over the item:</span>
-                        <strong aria-label={`Handover code ${issuedCodes[id]}`}>{issuedCodes[id]}</strong>
-                        <button type="button" className="btn btn-secondary" onClick={() => updateById(setIssuedCodes, id, '')}>Hide code</button>
-                      </div> : claim.handover_status === 'CODE_ISSUED' && new Date(claim.handover_code_expires_at).getTime() > Date.now()
-                        ? <p role="status">A code was already generated for this claim. It expires {new Date(claim.handover_code_expires_at).toLocaleString()}; a new code can be requested after that if needed.</p>
+                      {localCodeActive ? hiddenIssuedCodes[id]
+                        ? <div className="handover-code-display" role="status" aria-live="polite">
+                          <span>Your active handover code is hidden on this page.</span>
+                          <button type="button" className="btn btn-secondary" onClick={() => updateById(setHiddenIssuedCodes, id, false)}>Show code</button>
+                        </div>
+                        : <div className="handover-code-display" role="status" aria-live="polite">
+                          <span>Show this code to the person handing over the item:</span>
+                          <strong aria-label={`Handover code ${issuedCodes[id]}`}>{issuedCodes[id]}</strong>
+                          <button type="button" className="btn btn-secondary" onClick={() => updateById(setHiddenIssuedCodes, id, true)}>Hide code</button>
+                        </div> : serverCodeActive
+                        ? <p role="status">A code was already generated for this claim. It expires {new Date(claim.handover_code_expires_at).toLocaleString()}. For security, its value can only be shown in the session that generated it; if you leave that session, request a replacement after this code expires.</p>
                         : <button type="button" className="btn btn-primary" disabled={pendingAction === `issue-code-${id}`} onClick={() => handleIssueCode(claim)}>
                         {pendingAction === `issue-code-${id}` ? 'Preparing code…' : 'Get one-time handover code'}
                       </button>}
@@ -433,7 +473,7 @@ function ClaimWorkflow({ token, user, claims = [], onClaimsChange, onRefresh, hi
                           disabled={pendingAction === `enable-chat-${id}`}
                           onClick={() => handleEnableChat(claim)}
                         >
-                          {pendingAction === `enable-chat-${id}` ? 'Enabling chat…' : 'Enable chat for this claim'}
+                          {pendingAction === `enable-chat-${id}` ? 'Starting chat…' : 'Start chat with claimant'}
                         </button>
                         {actionErrors[`enable-chat-${id}`] && <p className="auth-error" role="alert">{actionErrors[`enable-chat-${id}`]}</p>}
                         {feedback[`enable-chat-${id}`] && <p className="claim-feedback" role="status">{feedback[`enable-chat-${id}`]}</p>}

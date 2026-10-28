@@ -3,6 +3,7 @@ import {
   getNotifications,
   getUnreadNotificationCount,
   clearAllNotifications,
+  deleteNotification,
   markAllNotificationsRead,
   markNotificationRead,
 } from '../api'
@@ -42,6 +43,8 @@ const DESCRIPTIONS = {
 }
 
 function NotificationCenter({ token }) {
+  const centerRef = useRef(null)
+  const touchStartX = useRef(null)
   const [open, setOpen] = useState(false)
   const [notifications, setNotifications] = useState([])
   const [unreadCount, setUnreadCount] = useState(0)
@@ -50,6 +53,7 @@ function NotificationCenter({ token }) {
   const [clearing, setClearing] = useState(false)
   const [markingAll, setMarkingAll] = useState(false)
   const [readingIds, setReadingIds] = useState(() => new Set())
+  const [swipedId, setSwipedId] = useState('')
   const refreshInFlight = useRef(new Set())
   const currentToken = useRef(token)
   const mounted = useRef(false)
@@ -59,6 +63,28 @@ function NotificationCenter({ token }) {
     return () => { mounted.current = false }
   }, [])
   useEffect(() => { currentToken.current = token }, [token])
+
+  useEffect(() => {
+    if (!open) return undefined
+    function dismissOutside(event) {
+      if (!centerRef.current?.contains(event.target)) {
+        setOpen(false)
+        setSwipedId('')
+      }
+    }
+    function dismissOnEscape(event) {
+      if (event.key === 'Escape') {
+        setOpen(false)
+        setSwipedId('')
+      }
+    }
+    document.addEventListener('pointerdown', dismissOutside)
+    document.addEventListener('keydown', dismissOnEscape)
+    return () => {
+      document.removeEventListener('pointerdown', dismissOutside)
+      document.removeEventListener('keydown', dismissOnEscape)
+    }
+  }, [open])
 
   const refresh = useCallback(async (includeList = open) => {
     if (!token || refreshInFlight.current.has(token)) return
@@ -158,8 +184,25 @@ function NotificationCenter({ token }) {
     }
   }
 
+  async function clearOne(notification) {
+    const id = String(notification.notification_id)
+    if (clearing) return
+    setClearing(true)
+    setError('')
+    try {
+      await deleteNotification(token, notification.notification_id)
+      setNotifications((previous) => previous.filter((item) => String(item.notification_id) !== id))
+      if (!notification.read_at) setUnreadCount((previous) => Math.max(0, previous - 1))
+      setSwipedId('')
+    } catch (clearError) {
+      setError(clearError.message || 'Could not clear notification.')
+    } finally {
+      setClearing(false)
+    }
+  }
+
   return (
-    <div className="notification-center">
+    <div className="notification-center" ref={centerRef}>
       <button type="button" className="btn btn-ghost notification-toggle" aria-expanded={open} aria-controls="notification-panel" onClick={togglePanel}>
         Notifications
         {unreadCount > 0 && <span className="notification-badge" aria-label={`${unreadCount} unread`}>{unreadCount > 99 ? '99+' : unreadCount}</span>}
@@ -181,13 +224,39 @@ function NotificationCenter({ token }) {
           ) : (
             <ul className="notification-list">
               {notifications.map((notification) => (
-                <li className={notification.read_at ? 'notification-item read' : 'notification-item unread'} key={notification.notification_id}>
-                  <span>{DESCRIPTIONS[notification.notification_type] || 'There is an update on one of your LostLink items.'}</span>
-                  <time dateTime={notification.created_at}>{new Date(notification.created_at).toLocaleString()}</time>
-                  {notification.navigation_target && (
-                    <a className="notification-open" href={notification.navigation_target} onClick={() => markRead(notification)}>View related activity</a>
-                  )}
-                  {!notification.read_at && <button type="button" className="notification-open" disabled={readingIds.has(String(notification.notification_id))} onClick={() => markRead(notification)}>{readingIds.has(String(notification.notification_id)) ? 'Marking…' : 'Mark as read'}</button>}
+                <li className="notification-row" key={notification.notification_id}>
+                  <button
+                    type="button"
+                    className="notification-swipe-clear"
+                    aria-label={`Clear notification: ${DESCRIPTIONS[notification.notification_type] || 'LostLink update'}`}
+                    tabIndex={swipedId === String(notification.notification_id) ? 0 : -1}
+                    onClick={() => clearOne(notification)}
+                    disabled={clearing}
+                  >Clear</button>
+                  <article
+                    className={`notification-item ${notification.read_at ? 'read' : 'unread'}${swipedId === String(notification.notification_id) ? ' swiped' : ''}`}
+                    tabIndex={0}
+                    aria-label="Notification. Use the left arrow key to reveal the clear action."
+                    onTouchStart={(event) => { touchStartX.current = event.changedTouches[0].clientX }}
+                    onTouchEnd={(event) => {
+                      if (touchStartX.current === null) return
+                      const delta = event.changedTouches[0].clientX - touchStartX.current
+                      if (delta < -45) setSwipedId(String(notification.notification_id))
+                      else if (delta > 45) setSwipedId('')
+                      touchStartX.current = null
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === 'ArrowLeft') setSwipedId(String(notification.notification_id))
+                      if (event.key === 'ArrowRight') setSwipedId('')
+                    }}
+                  >
+                    <span>{DESCRIPTIONS[notification.notification_type] || 'There is an update on one of your LostLink items.'}</span>
+                    <time dateTime={notification.created_at}>{new Date(notification.created_at).toLocaleString()}</time>
+                    {notification.navigation_target && (
+                      <a className="notification-open" href={notification.navigation_target} onClick={() => markRead(notification)}>View related activity</a>
+                    )}
+                    {!notification.read_at && <button type="button" className="notification-open" disabled={readingIds.has(String(notification.notification_id))} onClick={() => markRead(notification)}>{readingIds.has(String(notification.notification_id)) ? 'Marking…' : 'Mark as read'}</button>}
+                  </article>
                 </li>
               ))}
             </ul>

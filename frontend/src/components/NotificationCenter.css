@@ -63,13 +63,45 @@
   list-style: none;
 }
 
+.notification-row {
+  position: relative;
+  overflow: hidden;
+  border-radius: 8px;
+  touch-action: pan-y;
+}
+
+.notification-swipe-clear {
+  position: absolute;
+  inset: 0 0 0 auto;
+  width: 5rem;
+  border: 0;
+  background: #b63830;
+  color: white;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.notification-swipe-clear:focus-visible {
+  outline: 3px solid #66a98a;
+  outline-offset: -3px;
+}
+
 .notification-item {
+  position: relative;
+  z-index: 1;
   display: grid;
   gap: 0.35rem;
   padding: 0.7rem;
   border-radius: 8px;
   background: #f5f8f5;
   font-size: 0.86rem;
+  transition: transform 180ms ease;
+  touch-action: pan-y;
+}
+
+.notification-item.swiped {
+  transform: translateX(-5rem);
 }
 
 .notification-item.unread {

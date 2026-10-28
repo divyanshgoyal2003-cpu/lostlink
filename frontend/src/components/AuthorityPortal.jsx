@@ -15,8 +15,12 @@ import {
   reviewAuthorityMembership,
   provisionAuthorityAccount,
   getPrivatePhoto,
+  getChatModerationReports,
+  dismissChatUserReport,
+  reinstateChatUser,
 } from '../api'
 import './AuthorityPortal.css'
+import './ChatModeration.css'
 import ClaimPhotoAccess from './ClaimPhotoAccess'
 import ConversationInbox from './ConversationInbox'
 
@@ -65,10 +69,12 @@ function AuthorityPortal({ token, user, onLogin }) {
   const [reports, setReports] = useState([])
   const [assignments, setAssignments] = useState({})
   const [adminQueue, setAdminQueue] = useState({ destinations: [], memberships: [] })
+  const [moderationUsers, setModerationUsers] = useState([])
   const [capabilities, setCapabilities] = useState({ custodyTransfersEnabled: false })
   const [form, setForm] = useState({ authorityId: '', authorityName: '', institutionType: '', officialEmail: '', contactInformation: '', locationDescription: '', name: '', email: '', password: '' })
   const [codes, setCodes] = useState({})
   const [handoverCodes, setHandoverCodes] = useState({})
+  const [handoverErrors, setHandoverErrors] = useState({})
   const [issued, setIssued] = useState(null)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState('')
@@ -98,8 +104,14 @@ function AuthorityPortal({ token, user, onLogin }) {
       setCases(caseResult.cases || [])
       setCapabilities(feature)
       setReports(ownReports.reports || [])
-      if (user?.role === 'ADMIN') setAdminQueue(await getAuthorityAdminQueue(token))
-      else setAdminQueue({ destinations: [], memberships: [] })
+      if (user?.role === 'ADMIN') {
+        const [queue, moderation] = await Promise.all([getAuthorityAdminQueue(token), getChatModerationReports(token)])
+        setAdminQueue(queue)
+        setModerationUsers(moderation.users || [])
+      } else {
+        setAdminQueue({ destinations: [], memberships: [] })
+        setModerationUsers([])
+      }
     } catch (loadError) {
       setError(loadError.message || 'Could not load authority information.')
     } finally {
@@ -157,6 +169,23 @@ function AuthorityPortal({ token, user, onLogin }) {
     }
   }
 
+  async function moderationAction(action, id) {
+    const key = `moderation:${action}:${id}`
+    setSaving(key)
+    setError('')
+    setMessage('')
+    try {
+      if (action === 'dismiss') await dismissChatUserReport(token, id)
+      else await reinstateChatUser(token, id)
+      setMessage(action === 'dismiss' ? 'Report dismissed.' : 'Account reinstated.')
+      await load()
+    } catch (actionError) {
+      setError(actionError.message || 'Could not update the moderation report.')
+    } finally {
+      setSaving('')
+    }
+  }
+
   async function confirm(transferId) {
     setSaving(`transfer:${transferId}`)
     setError('')
@@ -175,6 +204,7 @@ function AuthorityPortal({ token, user, onLogin }) {
 
   async function confirmClaimReturn(claimId) {
     setSaving(`claim-return:${claimId}`)
+    setHandoverErrors((previous) => ({ ...previous, [claimId]: '' }))
     setError('')
     setMessage('')
     try {
@@ -183,7 +213,7 @@ function AuthorityPortal({ token, user, onLogin }) {
       setMessage('Safe return confirmed. The claim and related reports are now marked returned.')
       await load()
     } catch (confirmError) {
-      setError(confirmError.message || 'Could not confirm safe return.')
+      setHandoverErrors((previous) => ({ ...previous, [claimId]: confirmError.message || 'Could not confirm safe return.' }))
     } finally {
       setSaving('')
     }
@@ -268,8 +298,31 @@ function AuthorityPortal({ token, user, onLogin }) {
           <a className="btn btn-primary" href="#claim-review">Review claims</a>
           <a className="btn btn-secondary" href="#admin-authority-accounts">Create authority login</a>
           <a className="btn btn-secondary" href="#admin-authority-review">Review authority requests</a>
+          <a className="btn btn-secondary" href="#admin-chat-moderation">Chat reports</a>
         </nav>
       </div>}
+      {isAdmin && <section className="authority-panel chat-moderation-panel" id="admin-chat-moderation" aria-labelledby="chat-moderation-title">
+        <h3 id="chat-moderation-title">Chat safety reports</h3>
+        <p>Five distinct people reporting a user suspends the account. Review reports below; dismissed reports no longer count toward that threshold.</p>
+        {moderationUsers.length === 0 ? <p>No open chat reports.</p> : <div className="chat-moderation-list">
+          {moderationUsers.map((reported) => <article className="chat-moderation-user" key={reported.reported_user_id}>
+            <div className="authority-case-top"><span>{reported.reported_name} · {reported.reported_email}</span><span>{reported.account_status}</span></div>
+            <p><strong>{reported.distinct_reporters} distinct reports</strong> · account {reported.account_status.toLowerCase()}</p>
+            {(reported.reports || []).map((item) => <div className="chat-moderation-report" key={item.reportId}>
+              <strong>{item.category === 'ABUSIVE_LANGUAGE' ? 'Cuss words or abusive language' : 'Rude or harassing behavior'}</strong>
+              <p>“{item.message}”</p>
+              {item.details && <p>Reporter context: {item.details}</p>}
+              <small>Reported by {item.reporterName} · {new Date(item.createdAt).toLocaleString()} · Claim #{item.claimId}</small>
+              <button type="button" className="btn btn-secondary" disabled={Boolean(saving)} onClick={() => moderationAction('dismiss', item.reportId)}>
+                {saving === `moderation:dismiss:${item.reportId}` ? 'Dismissing…' : 'Dismiss this report'}
+              </button>
+            </div>)}
+            {reported.account_status === 'SUSPENDED' && <button type="button" className="btn btn-primary" disabled={Boolean(saving)} onClick={() => moderationAction('reinstate', reported.reported_user_id)}>
+              {saving === `moderation:reinstate:${reported.reported_user_id}` ? 'Reinstating…' : 'Reinstate account'}
+            </button>}
+          </article>)}
+        </div>}
+      </section>}
       <div className={`authority-layout${isAdmin ? ' admin-dashboard-layout' : showAuthorityCases ? '' : ' finder-return-layout'}`}>
           {showAuthorityCases && <div className="authority-panel" id={isAdmin ? 'admin-authority-accounts' : undefined}>
             {user?.role === 'ADMIN' ? <div className="authority-panel">
@@ -349,6 +402,7 @@ function AuthorityPortal({ token, user, onLogin }) {
                     <label htmlFor={`claim-return-code-${claim.claim_id}`}>Claimant’s safe-return code</label>
                     <input id={`claim-return-code-${claim.claim_id}`} inputMode="numeric" autoComplete="one-time-code" maxLength={8} pattern="[0-9]{8}" value={handoverCodes[claim.claim_id] || ''} onChange={(event) => setHandoverCodes((previous) => ({ ...previous, [claim.claim_id]: event.target.value.replace(/\D/g, '').slice(0, 8) }))} required />
                     <button className="btn btn-primary" disabled={Boolean(saving) || (handoverCodes[claim.claim_id] || '').length !== 8}>{saving === `claim-return:${claim.claim_id}` ? 'Confirming…' : 'Confirm safe return'}</button>
+                    {handoverErrors[claim.claim_id] && <p className="authority-alert error" role="alert">{handoverErrors[claim.claim_id]}</p>}
                   </form>}
                   {claim.handover_status === 'COMPLETED' && <p className="authority-received">Safe return confirmed.</p>}
                 </div>)}

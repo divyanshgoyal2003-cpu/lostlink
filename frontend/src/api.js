@@ -119,6 +119,21 @@ export async function getClaimConversation(token, claimId, { beforeMessageId, li
   return authenticatedRequest(`/conversations/claims/${encodeURIComponent(claimId)}${query.size ? `?${query}` : ''}`, token)
 }
 
+export async function reportChatUser(token, claimId, report) {
+  return authenticatedRequest(`/conversations/claims/${encodeURIComponent(claimId)}/user-reports`, token, {
+    method: 'POST', body: JSON.stringify(report),
+  })
+}
+export async function getChatModerationReports(token) {
+  return authenticatedRequest('/conversations/moderation/reports', token)
+}
+export async function dismissChatUserReport(token, reportId) {
+  return authenticatedRequest(`/conversations/moderation/reports/${encodeURIComponent(reportId)}/dismiss`, token, { method: 'PATCH' })
+}
+export async function reinstateChatUser(token, userId) {
+  return authenticatedRequest(`/conversations/moderation/users/${encodeURIComponent(userId)}/reinstate`, token, { method: 'POST' })
+}
+
 export async function getConversationInbox(token) { return authenticatedRequest('/conversations/inbox', token) }
 export async function markConversationRead(token, claimId, lastReadMessageId) {
   return authenticatedRequest(`/conversations/claims/${encodeURIComponent(claimId)}/read`, token, { method: 'PATCH', body: JSON.stringify({ lastReadMessageId }) })
@@ -266,12 +281,24 @@ export async function clearAllNotifications(token) {
   return result
 }
 
+export async function deleteNotification(token, notificationId) {
+  const result = await authenticatedRequest(`/notifications/${encodeURIComponent(notificationId)}`, token, { method: 'DELETE' })
+  notifyNotificationsChanged()
+  return result
+}
+
 export async function getClaimReviewQueue(token) {
   return authenticatedRequest('/claims/review-queue', token)
 }
 
 export async function enableClaimConversation(token, claimId) {
-  return authenticatedRequest(`/claims/${encodeURIComponent(claimId)}/conversation/open`, token, { method: 'POST' })
+  const result = await authenticatedRequest(`/claims/${encodeURIComponent(claimId)}/conversation/open`, token, { method: 'POST' })
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('lostlink:claim-conversation-opened', {
+      detail: { claimId: String(claimId) },
+    }))
+  }
+  return result
 }
 
 export async function getClaimVerifications(token, claimId) {

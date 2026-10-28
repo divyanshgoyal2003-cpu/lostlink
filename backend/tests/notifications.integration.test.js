@@ -64,6 +64,7 @@ test("notification endpoints require authentication", async () => {
     ["/api/notifications", "GET"],
     ["/api/notifications/unread-count", "GET"],
     ["/api/notifications/1/read", "PATCH"],
+    ["/api/notifications/1", "DELETE"],
     ["/api/notifications/read-all", "POST"],
     ["/api/notifications", "DELETE"],
   ]) {
@@ -123,8 +124,22 @@ test("list, count, mark-one, and mark-all are private, bounded, and idempotent",
   const otherRow = await pool.query("SELECT read_at FROM notifications WHERE notification_id = $1", [foreign.rows[0].notification_id])
   assert.equal(otherRow.rows[0].read_at, null)
 
+  const foreignDelete = await api(`/api/notifications/${foreign.rows[0].notification_id}`, {
+    method: "DELETE", token: user.token,
+  })
+  assert.equal(foreignDelete.status, 404)
+  const ownDelete = await api(`/api/notifications/${own.rows[1].notification_id}`, {
+    method: "DELETE", token: user.token,
+  })
+  assert.equal(ownDelete.status, 200)
+  assert.deepEqual(await ownDelete.json(), { deleted: true })
+  const repeatedDelete = await api(`/api/notifications/${own.rows[1].notification_id}`, {
+    method: "DELETE", token: user.token,
+  })
+  assert.equal(repeatedDelete.status, 404)
+
   const clearResponse = await api("/api/notifications", { method: "DELETE", token: user.token })
-  assert.deepEqual(await clearResponse.json(), { deletedCount: 2 })
+  assert.deepEqual(await clearResponse.json(), { deletedCount: 1 })
   const remainingOwn = await pool.query("SELECT notification_id FROM notifications WHERE user_id = $1", [user.user.user_id])
   const remainingForeign = await pool.query("SELECT notification_id FROM notifications WHERE notification_id = $1", [foreign.rows[0].notification_id])
   assert.equal(remainingOwn.rowCount, 0)

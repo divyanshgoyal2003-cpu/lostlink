@@ -16,6 +16,8 @@ function FoundPhotoCapture({ token, report }) {
   const [photos, setPhotos] = useState([])
   const [previews, setPreviews] = useState({})
   const [loading, setLoading] = useState(true)
+  const [photosLoaded, setPhotosLoaded] = useState(false)
+  const [photosVisible, setPhotosVisible] = useState(false)
   const [uploading, setUploading] = useState('')
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
@@ -35,6 +37,7 @@ function FoundPhotoCapture({ token, report }) {
         url: URL.createObjectURL(await getPrivatePhoto(token, photo.photoId, null, report.report_id)),
       })))
       setPreviews(Object.fromEntries(previewUrls.map(({ type, url }) => [type, url])))
+      setPhotosLoaded(true)
     } catch (loadError) {
       setError(loadError.message || 'Could not load your private photos.')
     } finally {
@@ -43,10 +46,11 @@ function FoundPhotoCapture({ token, report }) {
   }
 
   useEffect(() => {
+    if (!photosVisible || photosLoaded) return undefined
     loadPhotos()
-    // Reload only when identity/report changes; file changes use the event handler.
+    // Load only after the owner opens the panel; file changes use the event handler.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, report.report_id])
+  }, [token, report.report_id, photosLoaded, photosVisible])
 
   useEffect(() => () => Object.values(previews).forEach((url) => URL.revokeObjectURL(url)), [previews])
 
@@ -131,11 +135,28 @@ function FoundPhotoCapture({ token, report }) {
   return (
     <section className="found-photo-capture" aria-label="Private found-item photos">
       <div className="photo-capture-heading">
-        <h4>Private item photos</h4>
+        <div className="photo-capture-heading-row">
+          <h4>Private item photos</h4>
+          <button
+            type="button"
+            className="btn btn-secondary photo-capture-toggle"
+            aria-expanded={photosVisible}
+            aria-controls={`found-photo-capture-content-${report.report_id}`}
+            onClick={() => {
+              if (photosVisible) setCameraStep(null)
+              setPhotosVisible((visible) => !visible)
+            }}
+          >
+            {photosVisible ? 'Hide photos' : 'Show photos'}
+          </button>
+        </div>
         <p>Only you can view these photos until you explicitly share them for a specific claim.</p>
-        <p className="photo-capture-progress" role="status">Required views: {completedRequired}/3</p>
+        <p className="photo-capture-progress" role="status">
+          {photosLoaded ? `Required views: ${completedRequired}/3` : 'Photos stay hidden until you choose to show them.'}
+        </p>
       </div>
-      {loading ? <p role="status">Loading private photos…</p> : (
+      <div id={`found-photo-capture-content-${report.report_id}`} hidden={!photosVisible}>
+      {photosVisible && loading ? <p role="status">Loading private photos…</p> : photosVisible && (
         <div className="photo-capture-steps">
           {CAPTURE_STEPS.map((step) => {
             const existing = photos.find((photo) => photo.photoType === step.type)
@@ -188,6 +209,7 @@ function FoundPhotoCapture({ token, report }) {
       {message && <p className="claim-feedback" role="status">{message}</p>}
       {completedRequired === 3 && <p className="photo-capture-complete" role="status">Guided capture complete. Photos remain private by default.</p>}
       {completedRequired < 3 && <small>Complete Front, Back, and Side before guided capture is complete. Photos are never shared by uploading, matching, claiming, or opening a conversation.</small>}
+      </div>
     </section>
   )
 }

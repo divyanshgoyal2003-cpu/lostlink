@@ -385,7 +385,12 @@ router.get("/review-queue", authenticateToken, async (req, res) => {
         ORDER BY created_at DESC, verification_id DESC
         LIMIT 1
       ) latest ON TRUE
-      WHERE c.claim_status IN ('SUBMITTED', 'IN_REVIEW')
+      WHERE (
+        c.claim_status IN ('SUBMITTED', 'IN_REVIEW')
+        OR (c.claim_status = 'APPROVED'
+            AND found.recovery_mode = 'AUTHORITY'
+            AND conv.conversation_status IS DISTINCT FROM 'CLOSED')
+      )
         AND ($1::boolean OR (found.authority_id IS NULL AND $2::boolean) OR EXISTS (
           SELECT 1 FROM authority_memberships am
           JOIN authority_destinations ad ON ad.authority_id = am.authority_id

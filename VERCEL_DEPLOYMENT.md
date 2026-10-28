@@ -106,12 +106,13 @@ The repository has no automatic migration runner and does not apply migrations d
 3. `database/migrations/003_claim_photo_sharing.sql` — claim-scoped photo sharing history.
 4. `database/migrations/004_authorities_and_custody.sql` — authority destinations/memberships and separate custody records.
 5. `database/migrations/005_chat_proof_and_read_receipts.sql` — idempotency, read state, and proof requests/attachments.
+6. `database/migrations/006_chat_user_reports.sql` — private chat abuse reports and moderation history.
 
 There is no migration tracking table. Migration 001 is largely repeatable, but the other files contain ordinary `ALTER`/`CREATE` statements and must not be run twice. For a new empty database, confirm the target connection and backup location, enable PostGIS, then apply each file exactly once in order. For an existing database, inspect its schema and determine the last applied migration before running anything; do not infer migration state from the app version.
 
 ### Keep the current local reports and accounts
 
-If you want the hosted site to contain the users, reports, claims, matches, and history from your current local `lostlink` database, migrate that database’s data and schema to the managed provider. Creating a blank hosted database and applying the migrations creates an empty application; it does not copy local records. Take and verify a protected `pg_dump` backup first, create the managed target with compatible PostGIS support, then use the provider’s supported PostgreSQL restore/migration procedure to restore the dump. Keep the dump outside the repository and do not paste either database URL into chat, Git, or logs. After restore, verify all five migration-era schemas and PostGIS objects before pointing Vercel at the target. Do not apply migrations 001–005 again to a restored database. If you instead want a fresh start, use the empty-database migration procedure below and understand that the existing local records are not carried over.
+If you want the hosted site to contain the users, reports, claims, matches, and history from your current local `lostlink` database, migrate that database’s data and schema to the managed provider. Creating a blank hosted database and applying the migrations creates an empty application; it does not copy local records. Take and verify a protected `pg_dump` backup first, create the managed target with compatible PostGIS support, then use the provider’s supported PostgreSQL restore/migration procedure to restore the dump. Keep the dump outside the repository and do not paste either database URL into chat, Git, or logs. After restore, verify all six migration-era schemas and PostGIS objects before pointing Vercel at the target. Do not apply migrations 001–006 again to a restored database. If you instead want a fresh start, use the empty-database migration procedure below and understand that the existing local records are not carried over.
 
 For an empty database, one PowerShell approach is:
 
@@ -124,6 +125,7 @@ psql "$env:DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/002_add_stale
 psql "$env:DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/003_claim_photo_sharing.sql
 psql "$env:DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/004_authorities_and_custody.sql
 psql "$env:DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/005_chat_proof_and_read_receipts.sql
+psql "$env:DATABASE_URL" -v ON_ERROR_STOP=1 -f database/migrations/006_chat_user_reports.sql
 ```
 
 Store the backup outside the repository, verify it can be listed/restored, and confirm the database name and host before executing each migration. Do not run demo or seed scripts against Production. Afterward, verify the PostGIS extension, tables, constraints, indexes, triggers, and the central authority record in the provider console. Do not put connection strings in screenshots or logs.
