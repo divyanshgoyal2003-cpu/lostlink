@@ -25,6 +25,8 @@ function fixtureState() {
     proofRecipient: 20,
     proofContextClaimant: 20,
     proofDuplicate: false,
+    proofInsertCount: 0,
+    proofAuthorizationLookupCount: 0,
     invalidProof: false,
     proofContextCalls: 0,
     proofContextChangeAfter: null,
@@ -38,6 +40,7 @@ function fixtureState() {
 function fakePool(state) {
   const response = (rows) => ({ rows, rowCount: rows.length });
   async function query(sql) {
+    if (sql.includes('FROM conversation_proof_requests r JOIN conversations v USING(conversation_id)')) state.proofAuthorizationLookupCount += 1;
     if (state.dbFailure) throw new Error('mock database failure');
     if (sql.includes('SELECT p.photo_id, p.storage_key')) return response([{ photo_id: 3, storage_key: 'a3db4567-1111-4111-8111-abcdef123456.jpg', found_report_id: 51, finder_id: 10, authority_id: state.foundAuthorityId }]);
     if (sql.includes('SELECT p.photo_id, p.photo_type')) return response([{ photo_id: 3, photo_type: 'FRONT', uploaded_at: '2026-01-01T00:00:00.000Z' }]);
@@ -54,6 +57,8 @@ function fakePool(state) {
       return {
         async query(sql) {
           state.callbackCount += 1;
+          if (sql.includes('FROM conversation_proof_requests r JOIN conversations v USING(conversation_id)')) state.proofAuthorizationLookupCount += 1;
+          if (sql.includes('INSERT INTO conversation_proof_attachments')) state.proofInsertCount += 1;
           if (state.dbFailure) throw new Error('mock database failure');
           if (state.proofCallbackDbFailure && sql === 'BEGIN') throw new Error('mock proof callback database failure');
           if (state.callbackDbFailure && sql.includes('SELECT r.item_id FROM reports')) throw new Error('mock callback database failure');
@@ -83,6 +88,13 @@ async function fakeHandleUpload(req, res, options) {
   const parsed = clientUpload.clientIntent(req);
   if (!parsed) return res.status(401).json({ error: 'Private upload could not be authorized or completed.' });
   try {
+    if (parsed.callback) {
+      if (req.headers['x-vercel-signature'] !== 'test-signature') {
+        return res.status(400).json({ error: 'Private upload could not be authorized or completed.' });
+      }
+      await options.onCompleted(req.body.payload.blob, parsed.intent);
+      return res.status(200).json({ accepted: true });
+    }
     const key = options.getObjectName(parsed.intent);
     const trusted = await options.authorize(parsed.userId, parsed.intent, key);
     if (!trusted) return res.status(403).json({ error: 'Private upload could not be authorized or completed.' });
@@ -196,11 +208,36 @@ test('proof retrieval is limited to open-case participants and does not inherit 
   });
 });
 
+test('found-photo completion callback uses the SDK token payload after callback verification', async () => {
+  const state = fixtureState();
+  await withApp(state, async (base) => {
+    const objectName = 'a3db4567-1111-4111-8111-abcdef123456.jpg';
+    const body = {
+      type: 'blob.upload-completed',
+      payload: {
+        blob: { pathname: `lostlink/item-photos/${objectName}`, contentType: 'image/jpeg' },
+        tokenPayload: JSON.stringify({ userId: 20, reportId: 51, photoType: 'FRONT',
+          contentType: 'image/jpeg', objectName }),
+      },
+    };
+    const callback = () => fetch(`${base}/api/reports/51/photos/client-upload`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-vercel-signature': 'test-signature' },
+      body: JSON.stringify(body),
+    });
+    assert.equal((await callback()).status, 200);
+    assert.equal(state.callbackCount > 0, true);
+  });
+});
+
 test('found-photo upload callback reauthorizes the report owner and rejects expired or invalid tokens', async () => {
   const state = fixtureState();
   await withApp(state, async (base) => {
     const intent = { reportId: '51', photoType: 'FRONT', storageKey: 'a3db4567-1111-4111-8111-abcdef123456.jpg', contentType: 'image/jpeg' };
-    const payload = (token) => ({ type: 'blob.generate-client-token', payload: JSON.stringify({ ...intent, token }) });
+    const payload = (token) => ({ type: 'blob.generate-client-token', payload: {
+      pathname: `lostlink/item-photos/${intent.storageKey}`,
+      clientPayload: JSON.stringify({ ...intent, token }),
+      multipart: false,
+    } });
     const token = clientToken({ userId: 20 });
     state.ownerAuthorized = false;
     const rejectedOwner = await fetch(`${base}/api/reports/51/photos/client-upload`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload(token)) });
@@ -217,8 +254,67 @@ test('found-photo upload callback reauthorizes the report owner and rejects expi
     state.callbackDbFailure = false;
     const expired = await fetch(`${base}/api/reports/51/photos/client-upload`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload(clientToken({ userId: 20 }, '-1s'))) });
     assert.equal(expired.status, 401);
-    const invalid = await fetch(`${base}/api/reports/51/photos/client-upload`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'blob.generate-client-token', payload: '{' }) });
+    const invalid = await fetch(`${base}/api/reports/51/photos/client-upload`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'blob.generate-client-token', payload: { clientPayload: '{' } }) });
     assert.equal(invalid.status, 401);
+  });
+});
+
+test('proof completion callbacks do not query authorization data before SDK signature verification', async () => {
+  const state = fixtureState();
+  await withApp(state, async (base) => {
+    const objectName = 'a3db4567-1111-4111-8111-abcdef123456';
+    const callbackBody = (tokenPayload) => ({
+      type: 'blob.upload-completed',
+      payload: {
+        blob: { pathname: `lostlink/proof-attachments/${objectName}`, contentType: 'application/pdf' },
+        tokenPayload: JSON.stringify(tokenPayload),
+      },
+    });
+    const send = (body, signature) => fetch(`${base}/api/conversations/proof-requests/12/attachments/client-upload`, {
+      method: 'POST', headers: {
+        'content-type': 'application/json',
+        ...(signature ? { 'x-vercel-signature': signature } : {}),
+      }, body: JSON.stringify(body),
+    });
+
+    const malformed = await send(callbackBody({ objectName }), 'test-signature');
+    assert.equal(malformed.status, 401);
+    assert.equal(state.proofAuthorizationLookupCount, 0);
+
+    const validPayload = { userId: 20, requestId: 12, contentType: 'application/pdf',
+      note: 'Receipt', objectName };
+    const invalidSignature = await send(callbackBody(validPayload), 'invalid-signature');
+    assert.equal(invalidSignature.status, 400);
+    assert.equal(state.proofAuthorizationLookupCount, 0);
+    assert.equal(state.proofInsertCount, 0);
+
+    const accepted = await send(callbackBody(validPayload), 'test-signature');
+    assert.equal(accepted.status, 200);
+    assert.ok(state.proofAuthorizationLookupCount > 0);
+    assert.equal(state.proofInsertCount, 1);
+  });
+});
+
+test('verified proof callback cannot attach a file to another claimant or claim', async () => {
+  const state = fixtureState();
+  await withApp(state, async (base) => {
+    const objectName = 'a3db4567-1111-4111-8111-abcdef123456';
+    const response = await fetch(`${base}/api/conversations/proof-requests/12/attachments/client-upload`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-vercel-signature': 'test-signature' },
+      body: JSON.stringify({
+        type: 'blob.upload-completed',
+        payload: {
+          blob: { pathname: `lostlink/proof-attachments/${objectName}`, contentType: 'application/pdf' },
+          tokenPayload: JSON.stringify({ userId: 21, requestId: 12, contentType: 'application/pdf',
+            note: 'Receipt', objectName }),
+        },
+      }),
+    });
+    assert.equal(response.status, 500);
+    assert.equal(state.proofAuthorizationLookupCount, 1);
+    assert.equal(state.proofInsertCount, 0);
+    assert.equal(state.deleted, 1);
   });
 });
 
@@ -229,10 +325,14 @@ test('claimant proof uploads reauthorize the participant at callback time and ar
     const token = clientToken({ userId: 20 });
     const sendToken = (clientTokenValue) => fetch(`${base}/api/conversations/proof-requests/12/attachments/client-upload`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ type: 'blob.generate-client-token', payload: JSON.stringify({ ...intent, token: clientTokenValue }) }),
+      body: JSON.stringify({ type: 'blob.generate-client-token', payload: {
+        pathname: `lostlink/proof-attachments/${intent.storageKey}`,
+        clientPayload: JSON.stringify({ ...intent, token: clientTokenValue }),
+        multipart: false,
+      } }),
     });
     assert.equal((await sendToken(clientToken({ userId: 20 }, '-1s'))).status, 401);
-    assert.equal((await fetch(`${base}/api/conversations/proof-requests/12/attachments/client-upload`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'blob.generate-client-token', payload: '{' }) })).status, 401);
+    assert.equal((await fetch(`${base}/api/conversations/proof-requests/12/attachments/client-upload`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'blob.generate-client-token', payload: { clientPayload: '{' } }) })).status, 401);
     const send = () => sendToken(token);
     assert.equal((await send()).status, 200);
     state.proofDuplicate = true;

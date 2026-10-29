@@ -536,12 +536,18 @@ router.post("/proof-requests/:requestId/attachments/client-upload", async (req, 
   const { intent } = parsed;
   const contentTypes = ["application/pdf", "image/jpeg", "image/png", "image/webp"];
   if (String(intent.requestId) !== rid || !/^[a-f0-9-]{36}$/.test(intent.storageKey || "") || !contentTypes.includes(intent.contentType) || typeof intent.note !== "string" || intent.note.length > 500) return res.status(400).json({ error: "Invalid proof upload request" });
-  const auth = await pool.connect();
-  try {
-    const request = await auth.query("SELECT r.request_status,r.recipient_user_id,v.claim_id FROM conversation_proof_requests r JOIN conversations v USING(conversation_id) WHERE r.proof_request_id=$1", [rid]);
-    const context = request.rowCount ? await loadContext(auth, request.rows[0].claim_id, parsed.userId) : null;
-    if (!context || context.side !== "CLAIMANT" || !request.rowCount || Number(request.rows[0].recipient_user_id) !== parsed.userId || !["OPEN", "NEEDS_MORE_INFORMATION"].includes(request.rows[0].request_status)) return res.status(403).json({ error: "Proof upload is not available to this account" });
-  } finally { auth.release(); }
+  // Token-generation requests carry the user's JWT and must be authorized
+  // before asking the Blob SDK for a client capability. Completion callbacks
+  // carry an untrusted tokenPayload until handleUpload verifies Vercel's
+  // signature; their authorization check runs only inside onCompleted.
+  if (!parsed.callback) {
+    const auth = await pool.connect();
+    try {
+      const request = await auth.query("SELECT r.request_status,r.recipient_user_id,v.claim_id FROM conversation_proof_requests r JOIN conversations v USING(conversation_id) WHERE r.proof_request_id=$1", [rid]);
+      const context = request.rowCount ? await loadContext(auth, request.rows[0].claim_id, parsed.userId) : null;
+      if (!context || context.side !== "CLAIMANT" || !request.rowCount || Number(request.rows[0].recipient_user_id) !== parsed.userId || !["OPEN", "NEEDS_MORE_INFORMATION"].includes(request.rows[0].request_status)) return res.status(403).json({ error: "Proof upload is not available to this account" });
+    } finally { auth.release(); }
+  }
 
   return handlePrivateClientUpload(req, res, {
     namespace: "proof-attachments",

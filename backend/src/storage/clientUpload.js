@@ -15,8 +15,28 @@ function parseIntent(value) {
 }
 
 function clientIntent(req) {
-  if (req.body?.type !== 'blob.generate-client-token') return null;
-  return parseIntent(req.body?.payload);
+  const body = req.body;
+  if (body?.type === 'blob.generate-client-token') {
+    // The Blob SDK wraps clientPayload in its protocol envelope:
+    // { type, payload: { pathname, clientPayload, multipart } }.
+    return parseIntent(body.payload?.clientPayload);
+  }
+  if (body?.type === 'blob.upload-completed') {
+    // This context is used only to configure the callback handler. The SDK
+    // verifies Vercel's callback signature before invoking onUploadCompleted.
+    try {
+      const callback = JSON.parse(body.payload?.tokenPayload || '{}');
+      const userId = Number(callback?.userId);
+      if (!Number.isSafeInteger(userId) || userId <= 0 ||
+          !safeObjectName(callback?.objectName)) return null;
+      return {
+        intent: { ...callback, storageKey: callback.objectName },
+        userId,
+        callback: true,
+      };
+    } catch { return null; }
+  }
+  return null;
 }
 
 async function handlePrivateClientUpload(req, res, options) {

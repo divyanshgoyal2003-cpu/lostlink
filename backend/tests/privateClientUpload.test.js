@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const jwt = require('jsonwebtoken');
 const { test } = require('node:test');
 const { handlePrivateClientUpload, clientIntent } = require('../src/storage/clientUpload');
@@ -21,9 +22,23 @@ test('private client upload requires a valid authenticated token and scoped path
   try {
     const token = jwt.sign({ userId: 17, role: 'USER' }, process.env.JWT_SECRET);
     const payload = { token, reportId: '51', photoType: 'FRONT', storageKey: 'a3db4567-1111-4111-8111-abcdef123456.jpg', contentType: 'image/jpeg' };
-    const req = { body: { type: 'blob.generate-client-token', payload: JSON.stringify(payload) } };
+    const req = { body: { type: 'blob.generate-client-token', payload: {
+      pathname: 'lostlink/item-photos/a3db4567-1111-4111-8111-abcdef123456.jpg',
+      clientPayload: JSON.stringify(payload),
+      multipart: false,
+    } } };
     assert.equal(clientIntent(req).userId, 17);
-    assert.equal(clientIntent({ body: { type: 'blob.generate-client-token', payload: JSON.stringify({ ...payload, token: 'invalid' }) } }), null);
+    assert.equal(clientIntent({ body: { type: 'blob.generate-client-token', payload: {
+      pathname: 'lostlink/item-photos/a3db4567-1111-4111-8111-abcdef123456.jpg',
+      clientPayload: JSON.stringify({ ...payload, token: 'invalid' }),
+    } } }), null);
+    const callback = clientIntent({ body: { type: 'blob.upload-completed', payload: {
+      tokenPayload: JSON.stringify({ userId: 17, reportId: 51, photoType: 'FRONT',
+        contentType: 'image/jpeg', objectName: 'a3db4567-1111-4111-8111-abcdef123456.jpg' }),
+    } } });
+    assert.equal(callback.userId, 17);
+    assert.equal(callback.intent.storageKey, payload.storageKey);
+    assert.equal(clientIntent({ body: { type: 'blob.upload-completed', payload: { tokenPayload: '{}' } } }), null);
 
     const response = fakeResponse();
     let authorized = false;
@@ -54,6 +69,47 @@ test('private client upload requires a valid authenticated token and scoped path
   } finally {
     if (previous.node === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = previous.node;
     if (previous.jwt === undefined) delete process.env.JWT_SECRET; else process.env.JWT_SECRET = previous.jwt;
+  }
+});
+
+test('the installed Blob SDK rejects invalid callback signatures and accepts valid signatures', async () => {
+  const previous = { node: process.env.NODE_ENV, blob: process.env.BLOB_READ_WRITE_TOKEN };
+  process.env.NODE_ENV = 'production';
+  process.env.BLOB_READ_WRITE_TOKEN = 'unit-test-only-blob-read-write-key';
+  try {
+    const objectName = 'a3db4567-1111-4111-8111-abcdef123456';
+    const body = {
+      type: 'blob.upload-completed',
+      payload: {
+        blob: { pathname: `lostlink/proof-attachments/${objectName}`, contentType: 'application/pdf' },
+        tokenPayload: JSON.stringify({ userId: 17, requestId: 51, contentType: 'application/pdf',
+          note: 'Receipt', objectName }),
+      },
+    };
+    const invoke = async (signature) => {
+      const response = fakeResponse();
+      let completed = false;
+      await handlePrivateClientUpload({ body, headers: { 'x-vercel-signature': signature } }, response, {
+        namespace: 'proof-attachments',
+        allowedContentTypes: ['application/pdf'],
+        maximumSizeInBytes: 8 * 1024 * 1024,
+        getObjectName: (value) => value.storageKey,
+        authorize: async () => null,
+        onCompleted: async () => { completed = true; },
+      });
+      return { response, completed };
+    };
+    const validSignature = crypto.createHmac('sha256', process.env.BLOB_READ_WRITE_TOKEN)
+      .update(JSON.stringify(body)).digest('hex');
+    const rejected = await invoke('invalid-signature');
+    assert.equal(rejected.response.statusCode, 500);
+    assert.equal(rejected.completed, false);
+    const accepted = await invoke(validSignature);
+    assert.equal(accepted.response.statusCode, 200);
+    assert.equal(accepted.completed, true);
+  } finally {
+    if (previous.node === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = previous.node;
+    if (previous.blob === undefined) delete process.env.BLOB_READ_WRITE_TOKEN; else process.env.BLOB_READ_WRITE_TOKEN = previous.blob;
   }
 });
 
