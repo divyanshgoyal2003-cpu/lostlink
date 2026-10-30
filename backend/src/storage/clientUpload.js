@@ -43,8 +43,12 @@ async function handlePrivateClientUpload(req, res, options) {
   if (process.env.NODE_ENV !== 'production') return res.status(404).json({ error: 'Private client uploads are only enabled in production.' });
   try {
     const handleUpload = options.handleUpload || (await import('@vercel/blob/client')).handleUpload;
+    // Express rewrites req.url while handling a mounted router. Blob uses
+    // request.url to register its completion callback, so give it the full
+    // path that the platform received rather than the router-relative path.
+    const sdkRequest = { url: req.originalUrl || req.url, headers: req.headers };
     const response = await handleUpload({
-      request: req,
+      request: sdkRequest,
       body: req.body,
       onBeforeGenerateToken: async (pathname, clientPayload) => {
         const parsed = parseIntent(clientPayload);

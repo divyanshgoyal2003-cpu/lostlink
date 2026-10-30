@@ -22,7 +22,7 @@ test('private client upload requires a valid authenticated token and scoped path
   try {
     const token = jwt.sign({ userId: 17, role: 'USER' }, process.env.JWT_SECRET);
     const payload = { token, reportId: '51', photoType: 'FRONT', storageKey: 'a3db4567-1111-4111-8111-abcdef123456.jpg', contentType: 'image/jpeg' };
-    const req = { body: { type: 'blob.generate-client-token', payload: {
+    const req = { url: '/51/photos/client-upload', originalUrl: '/api/reports/51/photos/client-upload', headers: { host: 'lostlink-ecru.vercel.app' }, body: { type: 'blob.generate-client-token', payload: {
       pathname: 'lostlink/item-photos/a3db4567-1111-4111-8111-abcdef123456.jpg',
       clientPayload: JSON.stringify(payload),
       multipart: false,
@@ -50,7 +50,9 @@ test('private client upload requires a valid authenticated token and scoped path
       getObjectName: (value) => value.storageKey,
       authorize: async (userId) => { authorized = userId === 17; return authorized ? { reportId: 51, photoType: 'FRONT' } : null; },
       onCompleted: async (_blob, trusted) => { completed = trusted.userId === 17 && trusted.reportId === 51; },
-      handleUpload: async ({ onBeforeGenerateToken, onUploadCompleted }) => {
+      handleUpload: async ({ request, onBeforeGenerateToken, onUploadCompleted }) => {
+        assert.equal(request.url, '/api/reports/51/photos/client-upload');
+        assert.equal(request.headers, req.headers);
         const scope = await onBeforeGenerateToken('lostlink/item-photos/a3db4567-1111-4111-8111-abcdef123456.jpg', JSON.stringify(payload));
         assert.deepEqual(scope.allowedContentTypes, ['image/jpeg']);
         assert.equal(scope.maximumSizeInBytes, 8 * 1024 * 1024);
